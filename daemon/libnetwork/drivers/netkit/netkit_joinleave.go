@@ -107,8 +107,6 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 	if err := jinfo.InterfaceName().SetNames(containerIfName, containerVethPrefix, netlabel.GetIfname(epOpts)); err != nil {
 		return err
 	}
-	d.configNetwork.Lock()
-	d.configNetwork.Unlock()
 	if hasPublishedPorts(ep.extConnConfig) {
 		d.configNetwork.Lock()
 		rt, err := d.acquireParentRuntimeLocked(ctx, publishedPortScopeKey(n))
