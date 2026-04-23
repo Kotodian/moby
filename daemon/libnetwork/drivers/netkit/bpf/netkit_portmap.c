@@ -422,9 +422,10 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 				pkt->sport = icmph->un.echo.id;
 				pkt->dport = icmph->un.echo.id;
 			}
+			return 0;
 		}
 
-		return 0;
+		return -1;
 	}
 
 	if (l3_proto == bpf_htons(ETH_P_IPV6)) {

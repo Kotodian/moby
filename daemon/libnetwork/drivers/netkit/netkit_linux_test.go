@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -1904,6 +1906,28 @@ func TestLoadNetkitPortmapIncludesPublishedPortMaps(t *testing.T) {
 	assert.Check(t, spec.Maps["published_sock_v4"] != nil)
 	assert.Check(t, spec.Maps["published_sock_v6"] != nil)
 	assert.Check(t, spec.Maps["published_ifaces"] != nil)
+}
+
+func TestBPFIPv4ParserOnlyAcceptsICMPAmongUnsupportedL4(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	expected := "if (pkt->proto == IPPROTO_ICMP) {\n" +
+		"\t\t\tstruct icmphdr *icmph = data + pkt->l4_off;\n" +
+		"\n" +
+		"\t\t\tif ((void *)(icmph + 1) > data_end)\n" +
+		"\t\t\t\treturn -1;\n" +
+		"\t\t\tpkt->l4_csum_off = pkt->l4_off + offsetof(struct icmphdr, checksum);\n" +
+		"\t\t\tif (icmph->type == ICMP_ECHO || icmph->type == ICMP_ECHOREPLY) {\n" +
+		"\t\t\t\tpkt->sport = icmph->un.echo.id;\n" +
+		"\t\t\t\tpkt->dport = icmph->un.echo.id;\n" +
+		"\t\t\t}\n" +
+		"\t\t\treturn 0;\n" +
+		"\t\t}\n" +
+		"\n" +
+		"\t\treturn -1;"
+	assert.Check(t, strings.Contains(src, expected), "IPv4 parser must only accept ICMP after TCP/UDP; other protocols must remain unsupported")
 }
 
 func TestClassifyPublishedPortDatapathErrorUnsupportedIsNotImplemented(t *testing.T) {
