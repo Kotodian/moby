@@ -439,19 +439,23 @@ func (te *testEndpoint) ForceGw6()              {}
 type fakePublishedPortRuntime struct {
 	addEndpointCalls int
 	delEndpointCalls int
+	addedEndpoints   []publishedEndpointConfig
+	deletedEndpoints []publishedEndpointConfig
 	reconcileCalls   []publishedPortRequest
 	released         [][]portmapperapi.PortBinding
 	clearConntrack   int
 	closeCalls       int
 }
 
-func (f *fakePublishedPortRuntime) AddEndpoint(_ context.Context, _, _ *net.IPNet) error {
+func (f *fakePublishedPortRuntime) AddEndpoint(_ context.Context, ep publishedEndpointConfig) error {
 	f.addEndpointCalls++
+	f.addedEndpoints = append(f.addedEndpoints, ep)
 	return nil
 }
 
-func (f *fakePublishedPortRuntime) DelEndpoint(_ context.Context, _, _ *net.IPNet) error {
+func (f *fakePublishedPortRuntime) DelEndpoint(_ context.Context, ep publishedEndpointConfig) error {
 	f.delEndpointCalls++
+	f.deletedEndpoints = append(f.deletedEndpoints, ep)
 	return nil
 }
 
@@ -734,6 +738,7 @@ func TestJoinProgramsEgressMasqueradeState(t *testing.T) {
 
 	assert.NilError(t, d.Join(context.Background(), "dummy", "ep1", "/netns/fake", te, nil, nil))
 	assert.Check(t, is.Len(datapath.upsertedEndpoints, 1))
+	assert.Check(t, is.Equal(datapath.upsertedEndpoints[0].HostIf, "nkhost0"))
 	assert.Check(t, is.Equal(datapath.upsertedEndpoints[0].Addr.IP.String(), "172.30.0.11"))
 	assert.Check(t, datapath.upsertedEndpoints[0].MasqueradeIPv4)
 	assert.Check(t, datapath.upsertedEndpoints[0].HostIPv4 == nil)
@@ -825,6 +830,8 @@ func TestLeaveRemovesEgressMasqueradeState(t *testing.T) {
 	te := newTestEndpoint(mustParseCIDR(t, "172.30.0.0/24"), 11)
 	assert.NilError(t, d.CreateEndpoint(context.Background(), "dummy", "ep1", te.Interface(), nil))
 	assert.NilError(t, d.Join(context.Background(), "dummy", "ep1", "/netns/fake", te, nil, nil))
+	assert.DeepEqual(t, datapath.attached, []string{"nkhost0"})
+	assert.DeepEqual(t, epDatapath.attached, []string(nil))
 
 	assert.NilError(t, d.Leave("dummy", "ep1"))
 	assert.Check(t, is.Len(datapath.removedEndpoints, 1))
@@ -907,6 +914,7 @@ func TestJoinAndProgramExternalConnectivityPublishesPorts(t *testing.T) {
 	assert.Check(t, is.Equal(len(ep.extConnConfig.PortBindings), 1))
 	assert.Check(t, is.Equal(ep.publishedParent, "dummy"))
 	assert.Check(t, is.Equal(runtime.addEndpointCalls, 1))
+	assert.Check(t, is.Equal(runtime.addedEndpoints[0].HostIf, "nkhost0"))
 
 	assert.NilError(t, d.ProgramExternalConnectivity(context.Background(), "dummy", "ep1", "ep1", ""))
 	assert.Check(t, is.Equal(len(runtime.reconcileCalls), 1))
@@ -919,6 +927,7 @@ func TestJoinAndProgramExternalConnectivityPublishesPorts(t *testing.T) {
 	assert.NilError(t, d.Leave("dummy", "ep1"))
 	assert.Check(t, is.Equal(len(runtime.released), 1))
 	assert.Check(t, is.Equal(runtime.delEndpointCalls, 1))
+	assert.Check(t, is.Equal(runtime.deletedEndpoints[0].HostIf, "nkhost0"))
 	assert.Check(t, is.Equal(runtime.closeCalls, 1))
 }
 
@@ -1288,6 +1297,7 @@ func TestPopulateEndpointsRestoresPublishedPorts(t *testing.T) {
 
 	assert.NilError(t, d.populateEndpoints())
 	assert.Check(t, is.Equal(runtime.addEndpointCalls, 1))
+	assert.Check(t, is.Equal(runtime.addedEndpoints[0].HostIf, "nkhost0"))
 	assert.Check(t, is.Equal(len(runtime.reconcileCalls), 1))
 	assert.Check(t, is.Equal(len(d.parents), 1))
 	if _, ok := d.parents["n1"]; !ok {
@@ -1329,7 +1339,7 @@ func TestBridgePublishedPortRuntimeAllocatesIPv4PublishedPorts(t *testing.T) {
 	rt := rtAny.(*bridgePublishedPortRuntime)
 	ep4 := mustParseCIDR(t, "172.30.0.0/24")
 	ep4.IP = net.ParseIP("172.30.0.11")
-	assert.NilError(t, rt.AddEndpoint(context.Background(), ep4, nil))
+	assert.NilError(t, rt.AddEndpoint(context.Background(), publishedEndpointConfig{HostIf: "nk123", Addr: ep4}))
 
 	pbs, err := rt.ReconcilePortBindings(context.Background(), publishedPortRequest{
 		Addr: ep4,
@@ -1350,6 +1360,75 @@ func TestBridgePublishedPortRuntimeAllocatesIPv4PublishedPorts(t *testing.T) {
 	assert.Check(t, is.Equal(natPM.reqs[0][0].HostPort, uint16(8080)))
 	assert.Check(t, is.Equal(len(datapath.added), 1))
 	assert.Check(t, is.Equal(datapath.added[0][0].HostPort, uint16(8080)))
+}
+
+func TestBridgePublishedPortRuntimeProgramsPublishedEndpointForRedirect(t *testing.T) {
+	datapath := &fakePublishedPortDatapath{}
+	pms := &drvregistry.PortMappers{}
+	assert.NilError(t, pms.Register("nat", &stubPortMapper{}))
+
+	rtAny, err := newBridgePublishedPortRuntimeWithDatapath("net1", pms, datapath, false)
+	assert.NilError(t, err)
+
+	rt := rtAny.(*bridgePublishedPortRuntime)
+	ep4 := mustParseCIDR(t, "172.30.0.11/24")
+	ep6 := mustParseCIDR(t, "2001:db8::11/64")
+	ep := publishedEndpointConfig{
+		HostIf: "nk123",
+		Addr:   ep4,
+		Addrv6: ep6,
+	}
+
+	assert.NilError(t, rt.AddEndpoint(context.Background(), ep))
+	assert.Assert(t, is.Len(datapath.addedPublishedEndpoints, 1))
+	assert.Check(t, is.Equal(datapath.addedPublishedEndpoints[0].HostIf, "nk123"))
+	assert.Check(t, datapath.addedPublishedEndpoints[0].Addr.IP.Equal(net.ParseIP("172.30.0.11")))
+	assert.Check(t, datapath.addedPublishedEndpoints[0].Addrv6.IP.Equal(net.ParseIP("2001:db8::11")))
+
+	assert.NilError(t, rt.DelEndpoint(context.Background(), ep))
+	assert.Assert(t, is.Len(datapath.removedPublishedEndpoints, 1))
+	assert.Check(t, is.Equal(datapath.removedPublishedEndpoints[0].HostIf, "nk123"))
+	assert.Check(t, datapath.removedPublishedEndpoints[0].Addr.IP.Equal(net.ParseIP("172.30.0.11")))
+	assert.Check(t, datapath.removedPublishedEndpoints[0].Addrv6.IP.Equal(net.ParseIP("2001:db8::11")))
+}
+
+func TestEBPFPublishedPortDatapathTracksPublishedEndpointIfindex(t *testing.T) {
+	hostLinkByNameSaved := hostLinkByName
+	hostLinkByName = func(name string) (netlink.Link, error) {
+		return &netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: name, Index: 123}}, nil
+	}
+	defer func() {
+		hostLinkByName = hostLinkByNameSaved
+	}()
+
+	dp := &ebpfPublishedPortDatapath{
+		publishedEndpointIfindexV4: map[uint32]uint32{},
+		publishedEndpointIfindexV6: map[[16]byte]uint32{},
+	}
+	ep4 := mustParseCIDR(t, "172.30.0.11/24")
+	ep6 := mustParseCIDR(t, "2001:db8::11/64")
+
+	assert.NilError(t, dp.AddPublishedEndpoint(publishedEndpointConfig{
+		HostIf: "nk123",
+		Addr:   ep4,
+		Addrv6: ep6,
+	}))
+	key4, err := publishedEndpointKeyV4(ep4)
+	assert.NilError(t, err)
+	key6, err := publishedEndpointKeyV6(ep6)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(dp.publishedEndpointIfindexV4[key4], uint32(123)))
+	assert.Check(t, is.Equal(dp.publishedEndpointIfindexV6[key6], uint32(123)))
+
+	assert.NilError(t, dp.RemovePublishedEndpoint(publishedEndpointConfig{
+		HostIf: "nk123",
+		Addr:   ep4,
+		Addrv6: ep6,
+	}))
+	_, ok4 := dp.publishedEndpointIfindexV4[key4]
+	_, ok6 := dp.publishedEndpointIfindexV6[key6]
+	assert.Check(t, !ok4)
+	assert.Check(t, !ok6)
 }
 
 func TestBridgePublishedPortRuntimeKeepsHostPortWhenAddingIPv6(t *testing.T) {
@@ -1381,7 +1460,7 @@ func TestBridgePublishedPortRuntimeKeepsHostPortWhenAddingIPv6(t *testing.T) {
 	_, ep6, err := net.ParseCIDR("fd00::11/64")
 	assert.NilError(t, err)
 	ep6.IP = net.ParseIP("fd00::11")
-	assert.NilError(t, rt.AddEndpoint(context.Background(), ep4, ep6))
+	assert.NilError(t, rt.AddEndpoint(context.Background(), publishedEndpointConfig{HostIf: "nk123", Addr: ep4, Addrv6: ep6}))
 
 	current, err := rt.ReconcilePortBindings(context.Background(), publishedPortRequest{
 		Addr:   ep4,
@@ -1433,7 +1512,7 @@ func TestBridgePublishedPortRuntimeRejectsRootlessPortDrivers(t *testing.T) {
 
 	rt := rtAny.(*bridgePublishedPortRuntime)
 	ep4 := mustParseCIDR(t, "172.30.0.11/24")
-	assert.NilError(t, rt.AddEndpoint(context.Background(), ep4, nil))
+	assert.NilError(t, rt.AddEndpoint(context.Background(), publishedEndpointConfig{HostIf: "nk123", Addr: ep4}))
 
 	_, err = rt.ReconcilePortBindings(context.Background(), publishedPortRequest{
 		Addr: ep4,
@@ -1510,7 +1589,7 @@ func TestBridgePublishedPortRuntimeReleaseRemovesDatapathBindings(t *testing.T) 
 
 	rt := rtAny.(*bridgePublishedPortRuntime)
 	ep4 := mustParseCIDR(t, "172.30.0.11/24")
-	assert.NilError(t, rt.AddEndpoint(context.Background(), ep4, nil))
+	assert.NilError(t, rt.AddEndpoint(context.Background(), publishedEndpointConfig{HostIf: "nk123", Addr: ep4}))
 
 	pbs, err := rt.ReconcilePortBindings(context.Background(), publishedPortRequest{
 		Addr: ep4,
@@ -1740,13 +1819,27 @@ func (rootlessPortMapper) UnmapPorts(_ context.Context, _ []portmapperapi.PortBi
 }
 
 type fakePublishedPortDatapath struct {
-	added             [][]portmapperapi.PortBinding
-	removed           [][]portmapperapi.PortBinding
-	addedParents      []string
-	removedParents    []string
-	upsertedEndpoints []egressEndpointConfig
-	removedEndpoints  []egressEndpointConfig
-	closeCalls        int
+	added                     [][]portmapperapi.PortBinding
+	removed                   [][]portmapperapi.PortBinding
+	attached                  []string
+	detached                  []string
+	addedParents              []string
+	removedParents            []string
+	upsertedEndpoints         []egressEndpointConfig
+	removedEndpoints          []egressEndpointConfig
+	addedPublishedEndpoints   []publishedEndpointConfig
+	removedPublishedEndpoints []publishedEndpointConfig
+	closeCalls                int
+}
+
+func (f *fakePublishedPortDatapath) AttachEndpoint(hostIf string) error {
+	f.attached = append(f.attached, hostIf)
+	return nil
+}
+
+func (f *fakePublishedPortDatapath) DetachEndpoint(hostIf string) error {
+	f.detached = append(f.detached, hostIf)
+	return nil
 }
 
 func (f *fakePublishedPortDatapath) AddParent(parent string) error {
@@ -1766,6 +1859,16 @@ func (f *fakePublishedPortDatapath) UpsertEgressEndpoint(ep egressEndpointConfig
 
 func (f *fakePublishedPortDatapath) RemoveEgressEndpoint(ep egressEndpointConfig) error {
 	f.removedEndpoints = append(f.removedEndpoints, ep)
+	return nil
+}
+
+func (f *fakePublishedPortDatapath) AddPublishedEndpoint(ep publishedEndpointConfig) error {
+	f.addedPublishedEndpoints = append(f.addedPublishedEndpoints, ep)
+	return nil
+}
+
+func (f *fakePublishedPortDatapath) RemovePublishedEndpoint(ep publishedEndpointConfig) error {
+	f.removedPublishedEndpoints = append(f.removedPublishedEndpoints, ep)
 	return nil
 }
 

@@ -33,6 +33,7 @@ struct published_port_v4_value {
 	__u32 endpoint_ip;
 	__u16 endpoint_port;
 	__u16 flags;
+	__u32 ifindex;
 };
 
 struct published_port_v6_key {
@@ -46,6 +47,7 @@ struct published_port_v6_value {
 	__u8 endpoint_ip[16];
 	__u16 endpoint_port;
 	__u16 flags;
+	__u32 ifindex;
 };
 
 struct published_flow_v4_key {
@@ -117,6 +119,7 @@ struct egress_endpoint_v4_value {
 	__u8 flags;
 	__u8 pad1;
 	__u16 pad2;
+	__u32 ifindex;
 };
 
 struct egress_endpoint_v6_key {
@@ -128,6 +131,7 @@ struct egress_endpoint_v6_value {
 	__u8 flags;
 	__u8 pad1;
 	__u16 pad2;
+	__u32 ifindex;
 };
 
 struct egress_flow_v4_key {
@@ -142,6 +146,7 @@ struct egress_flow_v4_key {
 
 struct egress_flow_v4_value {
 	__u32 endpoint_ip;
+	__u32 ifindex;
 };
 
 struct egress_flow_v6_key {
@@ -156,6 +161,7 @@ struct egress_flow_v6_key {
 
 struct egress_flow_v6_value {
 	__u8 endpoint_ip[16];
+	__u32 ifindex;
 };
 
 struct egress_iface_value {
@@ -167,11 +173,11 @@ struct packet_info {
 	__u32 l3_off;
 	__u32 l4_off;
 	__u32 l4_csum_off;
+	__u16 l3_len;
 	__u8 family;
 	__u8 proto;
 	__u8 tos;
 	__u8 pad1;
-	__u32 pad2;
 	__be32 saddr4;
 	__be32 daddr4;
 	struct in6_addr saddr6;
@@ -374,6 +380,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 		pkt->family = AF_INET;
 		pkt->proto = iph->protocol;
 		pkt->tos = iph->tos;
+		pkt->l3_len = bpf_ntohs(iph->tot_len);
 		pkt->saddr4 = iph->saddr;
 		pkt->daddr4 = iph->daddr;
 		pkt->l4_off = pkt->l3_off + ihl;
@@ -414,6 +421,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 		pkt->family = AF_INET6;
 		pkt->proto = ip6h->nexthdr;
 		pkt->tos = 0;
+		pkt->l3_len = bpf_ntohs(ip6h->payload_len) + sizeof(*ip6h);
 		pkt->saddr6 = ip6h->saddr;
 		pkt->daddr6 = ip6h->daddr;
 		pkt->l4_off = pkt->l3_off + sizeof(*ip6h);
@@ -709,6 +717,8 @@ static __always_inline int rewrite_dnat_v4(struct __sk_buff *skb, const struct p
 		return TCX_NEXT;
 	if (replace_l4_port(skb, pkt, pkt->l4_off + offsetof(struct tcphdr, dest), pkt->dport, new_port) < 0)
 		return TCX_NEXT;
+	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
+		return bpf_redirect_peer(value->ifindex, 0);
 	return TCX_NEXT;
 }
 
@@ -722,6 +732,8 @@ static __always_inline int rewrite_dnat_v6(struct __sk_buff *skb, const struct p
 		return TCX_NEXT;
 	if (replace_l4_port(skb, pkt, pkt->l4_off + offsetof(struct tcphdr, dest), pkt->dport, new_port) < 0)
 		return TCX_NEXT;
+	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
+		return bpf_redirect_peer(value->ifindex, 0);
 	return TCX_NEXT;
 }
 
@@ -761,22 +773,34 @@ static __always_inline int rewrite_snat_v6(struct __sk_buff *skb, const struct p
 	return TCX_NEXT;
 }
 
-static __always_inline int rewrite_egress_snat_v4(struct __sk_buff *skb, const struct packet_info *pkt,
-						  __u32 host_ip)
+static __always_inline int apply_egress_snat_v4(struct __sk_buff *skb, const struct packet_info *pkt,
+						__u32 host_ip)
 {
 	__be32 new_addr = bpf_htonl(host_ip);
 
-	if (replace_ipv4_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct iphdr, saddr),
-			      pkt->l3_off + offsetof(struct iphdr, check), pkt->saddr4, new_addr, 1) < 0)
+	return replace_ipv4_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct iphdr, saddr),
+				 pkt->l3_off + offsetof(struct iphdr, check), pkt->saddr4, new_addr, 1);
+}
+
+static __always_inline int rewrite_egress_snat_v4(struct __sk_buff *skb, const struct packet_info *pkt,
+						  __u32 host_ip)
+{
+	if (apply_egress_snat_v4(skb, pkt, host_ip) < 0)
 		return TCX_NEXT;
 	return TCX_NEXT;
+}
+
+static __always_inline int apply_egress_snat_v6(struct __sk_buff *skb, const struct packet_info *pkt,
+						const __u8 host_ip[16])
+{
+	return replace_ipv6_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct ipv6hdr, saddr),
+				 pkt->saddr6.in6_u.u6_addr8, host_ip);
 }
 
 static __always_inline int rewrite_egress_snat_v6(struct __sk_buff *skb, const struct packet_info *pkt,
 						  const __u8 host_ip[16])
 {
-	if (replace_ipv6_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct ipv6hdr, saddr),
-			      pkt->saddr6.in6_u.u6_addr8, host_ip) < 0)
+	if (apply_egress_snat_v6(skb, pkt, host_ip) < 0)
 		return TCX_NEXT;
 	return TCX_NEXT;
 }
@@ -789,6 +813,8 @@ static __always_inline int rewrite_egress_return_v4(struct __sk_buff *skb, const
 	if (replace_ipv4_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct iphdr, daddr),
 			      pkt->l3_off + offsetof(struct iphdr, check), pkt->daddr4, new_addr, 1) < 0)
 		return TCX_NEXT;
+	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
+		return bpf_redirect_peer(value->ifindex, 0);
 	return TCX_NEXT;
 }
 
@@ -798,6 +824,8 @@ static __always_inline int rewrite_egress_return_v6(struct __sk_buff *skb, const
 	if (replace_ipv6_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct ipv6hdr, daddr),
 			      pkt->daddr6.in6_u.u6_addr8, value->endpoint_ip) < 0)
 		return TCX_NEXT;
+	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
+		return bpf_redirect_peer(value->ifindex, 0);
 	return TCX_NEXT;
 }
 
@@ -871,7 +899,8 @@ static __always_inline int lookup_flow_v6(const struct packet_info *pkt,
 	return *value ? 0 : -1;
 }
 
-static __always_inline void remember_egress_flow_v4(const struct packet_info *pkt, __u32 host_ip)
+static __always_inline void remember_egress_flow_v4(const struct packet_info *pkt, __u32 host_ip,
+						    __u32 ifindex)
 {
 	struct egress_flow_v4_key key = {
 		.src_ip = bpf_ntohl(pkt->daddr4),
@@ -882,12 +911,14 @@ static __always_inline void remember_egress_flow_v4(const struct packet_info *pk
 	};
 	struct egress_flow_v4_value value = {
 		.endpoint_ip = bpf_ntohl(pkt->saddr4),
+		.ifindex = ifindex,
 	};
 
 	bpf_map_update_elem(&egress_flows_v4, &key, &value, BPF_ANY);
 }
 
-static __always_inline void remember_egress_flow_v6(const struct packet_info *pkt, const __u8 host_ip[16])
+static __always_inline void remember_egress_flow_v6(const struct packet_info *pkt, const __u8 host_ip[16],
+						    __u32 ifindex)
 {
 	struct egress_flow_v6_key key = {
 		.src_port = bpf_ntohs(pkt->dport),
@@ -899,6 +930,7 @@ static __always_inline void remember_egress_flow_v6(const struct packet_info *pk
 	__builtin_memcpy(key.src_ip, pkt->daddr6.in6_u.u6_addr8, sizeof(key.src_ip));
 	__builtin_memcpy(key.dst_ip, host_ip, sizeof(key.dst_ip));
 	__builtin_memcpy(value.endpoint_ip, pkt->saddr6.in6_u.u6_addr8, sizeof(value.endpoint_ip));
+	value.ifindex = ifindex;
 	bpf_map_update_elem(&egress_flows_v6, &key, &value, BPF_ANY);
 }
 
@@ -1220,7 +1252,7 @@ static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u
 		}
 
 		netkit_dbg("host egress4 snat host=%x", host_ip);
-		remember_egress_flow_v4(&pkt, host_ip);
+		remember_egress_flow_v4(&pkt, host_ip, 0);
 		return rewrite_egress_snat_v4(skb, &pkt, host_ip);
 	}
 
@@ -1236,8 +1268,121 @@ static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u
 		if (resolve_egress_ipv6(ifindex, endpoint, host_ip) < 0)
 			return TCX_NEXT;
 
-		remember_egress_flow_v6(&pkt, host_ip);
+		remember_egress_flow_v6(&pkt, host_ip, 0);
 		return rewrite_egress_snat_v6(skb, &pkt, host_ip);
+	}
+
+	return TCX_NEXT;
+}
+
+static __always_inline int redirect_endpoint_egress_v4(struct __sk_buff *skb,
+						       const struct packet_info *pkt,
+						       const struct egress_endpoint_v4_value *endpoint)
+{
+	struct bpf_redir_neigh neigh = {};
+	struct bpf_fib_lookup fib = {};
+	__u32 host_ip;
+	long ret;
+
+	fib.family = AF_INET;
+	fib.l4_protocol = pkt->proto;
+	fib.sport = pkt->sport;
+	fib.dport = pkt->dport;
+	fib.tot_len = pkt->l3_len;
+	fib.ifindex = skb->ifindex;
+	fib.tos = pkt->tos;
+	fib.ipv4_src = pkt->saddr4;
+	fib.ipv4_dst = pkt->daddr4;
+
+	ret = bpf_fib_lookup(skb, &fib, sizeof(fib), BPF_FIB_LOOKUP_SKIP_NEIGH);
+	if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
+		netkit_dbg("endpoint egress4 fib miss ret=%ld src=%x dst=%x if=%d", ret,
+			   bpf_ntohl(pkt->saddr4), bpf_ntohl(pkt->daddr4), skb->ifindex);
+		return TCX_NEXT;
+	}
+	if (resolve_egress_ipv4(fib.ifindex, endpoint, &host_ip) < 0) {
+		netkit_dbg("endpoint egress4 resolve miss out_if=%d", fib.ifindex);
+		return TCX_NEXT;
+	}
+
+	remember_egress_flow_v4(pkt, host_ip, endpoint->ifindex);
+	if (apply_egress_snat_v4(skb, pkt, host_ip) < 0) {
+		netkit_dbg("endpoint egress4 snat fail host=%x out_if=%d", host_ip, fib.ifindex);
+		return TCX_NEXT;
+	}
+
+	neigh.nh_family = AF_INET;
+	neigh.ipv4_nh = fib.ipv4_dst;
+	netkit_dbg("endpoint egress4 redirect host=%x out_if=%d nh=%x", host_ip, fib.ifindex,
+		   bpf_ntohl(fib.ipv4_dst));
+	return bpf_redirect_neigh(fib.ifindex, &neigh, sizeof(neigh), 0);
+}
+
+static __always_inline int redirect_endpoint_egress_v6(struct __sk_buff *skb,
+						       const struct packet_info *pkt,
+						       const struct egress_endpoint_v6_value *endpoint)
+{
+	struct bpf_redir_neigh neigh = {};
+	struct bpf_fib_lookup fib = {};
+	__u8 host_ip[16];
+	long ret;
+
+	fib.family = AF_INET6;
+	fib.l4_protocol = pkt->proto;
+	fib.sport = pkt->sport;
+	fib.dport = pkt->dport;
+	fib.tot_len = pkt->l3_len;
+	fib.ifindex = skb->ifindex;
+	__builtin_memcpy(fib.ipv6_src, pkt->saddr6.in6_u.u6_addr32, sizeof(fib.ipv6_src));
+	__builtin_memcpy(fib.ipv6_dst, pkt->daddr6.in6_u.u6_addr32, sizeof(fib.ipv6_dst));
+
+	ret = bpf_fib_lookup(skb, &fib, sizeof(fib), BPF_FIB_LOOKUP_SKIP_NEIGH);
+	if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
+		netkit_dbg("endpoint egress6 fib miss ret=%ld if=%d", ret, skb->ifindex);
+		return TCX_NEXT;
+	}
+	if (resolve_egress_ipv6(fib.ifindex, endpoint, host_ip) < 0) {
+		netkit_dbg("endpoint egress6 resolve miss out_if=%d", fib.ifindex);
+		return TCX_NEXT;
+	}
+
+	remember_egress_flow_v6(pkt, host_ip, endpoint->ifindex);
+	if (apply_egress_snat_v6(skb, pkt, host_ip) < 0) {
+		netkit_dbg("endpoint egress6 snat fail out_if=%d", fib.ifindex);
+		return TCX_NEXT;
+	}
+
+	neigh.nh_family = AF_INET6;
+	__builtin_memcpy(neigh.ipv6_nh, fib.ipv6_dst, sizeof(neigh.ipv6_nh));
+	netkit_dbg("endpoint egress6 redirect out_if=%d", fib.ifindex);
+	return bpf_redirect_neigh(fib.ifindex, &neigh, sizeof(neigh), 0);
+}
+
+static __always_inline int process_endpoint_egress(struct __sk_buff *skb)
+{
+	struct packet_info pkt = {};
+
+	if (parse_packet(skb, &pkt) < 0)
+		return TCX_NEXT;
+
+	if (pkt.family == AF_INET) {
+		const struct egress_endpoint_v4_value *endpoint;
+
+		if (lookup_egress_endpoint_v4(&pkt, &endpoint) < 0) {
+			netkit_dbg("endpoint egress4 endpoint miss src=%x", bpf_ntohl(pkt.saddr4));
+			return TCX_NEXT;
+		}
+		return redirect_endpoint_egress_v4(skb, &pkt, endpoint);
+	}
+
+	if (pkt.family == AF_INET6) {
+		const struct egress_endpoint_v6_value *endpoint;
+
+		if (lookup_egress_endpoint_v6(&pkt, &endpoint) < 0) {
+			netkit_dbg("endpoint egress6 endpoint miss");
+			return TCX_NEXT;
+		}
+		return redirect_endpoint_egress_v6(skb, &pkt, endpoint);
 	}
 
 	return TCX_NEXT;
@@ -1293,7 +1438,11 @@ int endpoint_primary(struct __sk_buff *skb)
 SEC("netkit/peer")
 int endpoint_peer(struct __sk_buff *skb)
 {
-	return tcx_to_netkit_action(process_published_egress(skb));
+	int ret = process_published_egress(skb);
+
+	if (ret != TCX_NEXT)
+		return tcx_to_netkit_action(ret);
+	return tcx_to_netkit_action(process_endpoint_egress(skb));
 }
 
 SEC("cgroup/connect4")

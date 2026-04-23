@@ -148,14 +148,14 @@ func (d *driver) restorePublishedPorts(ctx context.Context, ep *endpoint) error 
 		}
 	}()
 
-	if err := rt.AddEndpoint(ctx, ep.addr, ep.addrv6); err != nil {
+	if err := rt.AddEndpoint(ctx, publishedEndpointConfigForEndpoint(ep)); err != nil {
 		return err
 	}
 
 	restoreSucceeded := false
 	defer func() {
 		if !restoreSucceeded {
-			_ = rt.DelEndpoint(context.TODO(), ep.addr, ep.addrv6)
+			_ = rt.DelEndpoint(context.TODO(), publishedEndpointConfigForEndpoint(ep))
 		}
 	}()
 

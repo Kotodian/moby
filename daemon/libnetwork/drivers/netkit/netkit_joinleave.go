@@ -85,9 +85,6 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 	ep.hostIf = hostIfName
 	markCreatedInContainer(jinfo)
 
-	if err := d.attachEndpointDatapath(ctx, ep); err != nil {
-		return err
-	}
 	if err := setJoinGateways(jinfo, ep, n.config, eid); err != nil {
 		return err
 	}
@@ -102,16 +99,11 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 			_ = d.removeEgressEndpointDatapath(ep)
 		}
 	}()
-	jinfo.DisableGatewayService()
-
-	if err := jinfo.InterfaceName().SetNames(containerIfName, containerVethPrefix, netlabel.GetIfname(epOpts)); err != nil {
-		return err
-	}
 	if hasPublishedPorts(ep.extConnConfig) {
 		d.configNetwork.Lock()
 		rt, err := d.acquireParentRuntimeLocked(ctx, publishedPortScopeKey(n))
 		if err == nil {
-			err = rt.AddEndpoint(ctx, ep.addr, ep.addrv6)
+			err = rt.AddEndpoint(ctx, publishedEndpointConfigForEndpoint(ep))
 		}
 		if err != nil {
 			_ = d.releaseParentRuntimeLocked(ctx, publishedPortScopeKey(n))
@@ -126,12 +118,25 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 			}
 			d.configNetwork.Lock()
 			if pr := d.parents[ep.publishedParent]; pr != nil {
-				_ = pr.runtime.DelEndpoint(context.TODO(), ep.addr, ep.addrv6)
+				_ = pr.runtime.DelEndpoint(context.TODO(), publishedEndpointConfigForEndpoint(ep))
 				_ = d.releaseParentRuntimeLocked(context.TODO(), ep.publishedParent)
 			}
 			ep.publishedParent = ""
 			d.configNetwork.Unlock()
 		}()
+	}
+	if err := d.attachEndpointDatapath(ctx, ep); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = d.detachEndpointDatapath(ep)
+		}
+	}()
+	jinfo.DisableGatewayService()
+
+	if err := jinfo.InterfaceName().SetNames(containerIfName, containerVethPrefix, netlabel.GetIfname(epOpts)); err != nil {
+		return err
 	}
 	if err := d.storeUpdate(ep); err != nil {
 		return fmt.Errorf("failed to save netkit endpoint %.7s to store: %v", ep.id, err)
@@ -195,7 +200,7 @@ func (d *driver) Leave(nid, eid string) error {
 					return err
 				}
 			}
-			if err := pr.runtime.DelEndpoint(context.TODO(), ep.addr, ep.addrv6); err != nil {
+			if err := pr.runtime.DelEndpoint(context.TODO(), publishedEndpointConfigForEndpoint(ep)); err != nil {
 				return err
 			}
 			if err := d.releaseParentRuntimeLocked(context.TODO(), ep.publishedParent); err != nil {

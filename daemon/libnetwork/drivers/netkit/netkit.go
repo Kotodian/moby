@@ -86,9 +86,15 @@ type publishedPortRequest struct {
 	DesiredMode  portBindingMode
 }
 
+type publishedEndpointConfig struct {
+	HostIf string
+	Addr   *net.IPNet
+	Addrv6 *net.IPNet
+}
+
 type publishedPortRuntime interface {
-	AddEndpoint(ctx context.Context, ep4, ep6 *net.IPNet) error
-	DelEndpoint(ctx context.Context, ep4, ep6 *net.IPNet) error
+	AddEndpoint(ctx context.Context, ep publishedEndpointConfig) error
+	DelEndpoint(ctx context.Context, ep publishedEndpointConfig) error
 	ReconcilePortBindings(ctx context.Context, req publishedPortRequest) ([]portmapperapi.PortBinding, error)
 	ReleasePortBindings(ctx context.Context, bindings []portmapperapi.PortBinding) error
 	ClearConntrack(ep4, ep6 *net.IPNet, bindings []portmapperapi.PortBinding)

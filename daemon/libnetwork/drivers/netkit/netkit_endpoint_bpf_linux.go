@@ -189,6 +189,11 @@ func (d *driver) attachEndpointDatapath(ctx context.Context, ep *endpoint) error
 	}
 
 	d.mu.Lock()
+	if d.datapath != nil {
+		dp := d.datapath
+		d.mu.Unlock()
+		return dp.AttachEndpoint(ep.hostIf)
+	}
 	dp := d.endpointDatapath
 	if dp == nil {
 		ctor := d.newEndpointDatapath
@@ -214,6 +219,11 @@ func (d *driver) detachEndpointDatapath(ep *endpoint) error {
 	}
 
 	d.mu.Lock()
+	if d.datapath != nil {
+		dp := d.datapath
+		d.mu.Unlock()
+		return dp.DetachEndpoint(ep.hostIf)
+	}
 	dp := d.endpointDatapath
 	d.mu.Unlock()
 	if dp == nil {

@@ -30,6 +30,7 @@ func egressEndpointConfigForNetwork(cfg *configuration, ep *endpoint) (egressEnd
 	}
 
 	config := egressEndpointConfig{
+		HostIf: ep.hostIf,
 		Addr:   cloneIPNet(ep.addr),
 		Addrv6: cloneIPNet(ep.addrv6),
 	}
@@ -69,6 +70,17 @@ func endpointDatapathKey(ep *endpoint) string {
 		return ""
 	}
 	return ep.nid + "/" + ep.id
+}
+
+func publishedEndpointConfigForEndpoint(ep *endpoint) publishedEndpointConfig {
+	if ep == nil {
+		return publishedEndpointConfig{}
+	}
+	return publishedEndpointConfig{
+		HostIf: ep.hostIf,
+		Addr:   cloneIPNet(ep.addr),
+		Addrv6: cloneIPNet(ep.addrv6),
+	}
 }
 
 func (d *driver) upsertEgressEndpointDatapath(ctx context.Context, n *network, ep *endpoint) error {
@@ -148,7 +160,7 @@ func (d *driver) ProgramExternalConnectivity(ctx context.Context, nid, eid strin
 		if err != nil {
 			return err
 		}
-		if err := rt.AddEndpoint(ctx, ep.addr, ep.addrv6); err != nil {
+		if err := rt.AddEndpoint(ctx, publishedEndpointConfigForEndpoint(ep)); err != nil {
 			_ = d.releaseParentRuntimeLocked(ctx, publishedPortScopeKey(n))
 			return err
 		}
@@ -279,6 +291,7 @@ type bridgePublishedPortRuntime struct {
 }
 
 type publishedEndpointState struct {
+	hostIf   string
 	ep4      *net.IPNet
 	ep6      *net.IPNet
 	bindings []portmapperapi.PortBinding
@@ -317,27 +330,32 @@ func newBridgePublishedPortRuntimeWithDatapath(parent string, pms *drvregistry.P
 	}, nil
 }
 
-func (r *bridgePublishedPortRuntime) AddEndpoint(_ context.Context, ep4, ep6 *net.IPNet) error {
+func (r *bridgePublishedPortRuntime) AddEndpoint(_ context.Context, ep publishedEndpointConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	key := endpointStateKey(ep4, ep6)
+	if err := r.datapath.AddPublishedEndpoint(ep); err != nil {
+		return err
+	}
+
+	key := endpointStateKey(ep.Addr, ep.Addrv6)
 	state := r.endpoints[key]
 	if state == nil {
 		state = &publishedEndpointState{}
 		r.endpoints[key] = state
 	}
-	state.ep4 = cloneIPNet(ep4)
-	state.ep6 = cloneIPNet(ep6)
+	state.hostIf = ep.HostIf
+	state.ep4 = cloneIPNet(ep.Addr)
+	state.ep6 = cloneIPNet(ep.Addrv6)
 	return nil
 }
 
-func (r *bridgePublishedPortRuntime) DelEndpoint(_ context.Context, ep4, ep6 *net.IPNet) error {
+func (r *bridgePublishedPortRuntime) DelEndpoint(_ context.Context, ep publishedEndpointConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.endpoints, endpointStateKey(ep4, ep6))
-	return nil
+	delete(r.endpoints, endpointStateKey(ep.Addr, ep.Addrv6))
+	return r.datapath.RemovePublishedEndpoint(ep)
 }
 
 func (r *bridgePublishedPortRuntime) ReconcilePortBindings(ctx context.Context, req publishedPortRequest) ([]portmapperapi.PortBinding, error) {

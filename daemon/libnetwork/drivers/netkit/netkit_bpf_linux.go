@@ -30,10 +30,14 @@ const egressEndpointFlagMasquerade = 1 << 0
 const publishedPortCgroupPath = "/sys/fs/cgroup"
 
 type publishedPortDatapath interface {
+	AttachEndpoint(hostIf string) error
+	DetachEndpoint(hostIf string) error
 	AddParent(parent string) error
 	RemoveParent(parent string) error
 	UpsertEgressEndpoint(ep egressEndpointConfig) error
 	RemoveEgressEndpoint(ep egressEndpointConfig) error
+	AddPublishedEndpoint(ep publishedEndpointConfig) error
+	RemovePublishedEndpoint(ep publishedEndpointConfig) error
 	AddBindings(bindings []portmapperapi.PortBinding) error
 	RemoveBindings(bindings []portmapperapi.PortBinding) error
 	Close() error
@@ -54,25 +58,32 @@ var hostAddrList = func(link netlink.Link, family int) ([]netlink.Addr, error) {
 }
 
 type egressEndpointConfig struct {
-	Addr           *net.IPNet
-	Addrv6         *net.IPNet
-	HostIPv4       net.IP
-	HostIPv6       net.IP
-	MasqueradeIPv4 bool
-	MasqueradeIPv6 bool
+	Addr            *net.IPNet
+	Addrv6          *net.IPNet
+	HostIf          string
+	EndpointIfindex uint32
+	HostIPv4        net.IP
+	HostIPv6        net.IP
+	MasqueradeIPv4  bool
+	MasqueradeIPv6  bool
 }
 
 type ebpfPublishedPortDatapath struct {
 	mu sync.Mutex
 
-	handles           netkitPortmapHandles
-	globalLinks       []link.Link
-	globalIfindices   map[int]struct{}
-	parentLinks       map[string][]link.Link
-	parentAttachments map[string][]publishedPortTCXAttachment
+	handles                    netkitPortmapHandles
+	globalLinks                []link.Link
+	globalIfindices            map[int]struct{}
+	parentLinks                map[string][]link.Link
+	parentAttachments          map[string][]publishedPortTCXAttachment
+	endpointLinks              map[string][]link.Link
+	publishedEndpointIfindexV4 map[uint32]uint32
+	publishedEndpointIfindexV6 map[[16]byte]uint32
 }
 
 type netkitPortmapHandles struct {
+	EndpointPrimary   *ebpf.Program `ebpf:"endpoint_primary"`
+	EndpointPeer      *ebpf.Program `ebpf:"endpoint_peer"`
 	PortmapIngress    *ebpf.Program `ebpf:"portmap_ingress"`
 	PortmapEgress     *ebpf.Program `ebpf:"portmap_egress"`
 	Connect4          *ebpf.Program `ebpf:"connect4"`
@@ -111,6 +122,7 @@ type publishedPortV4Value struct {
 	EndpointIP   uint32
 	EndpointPort uint16
 	Flags        uint16
+	Ifindex      uint32
 }
 
 type publishedPortV6Key struct {
@@ -124,6 +136,7 @@ type publishedPortV6Value struct {
 	EndpointIP   [16]byte
 	EndpointPort uint16
 	Flags        uint16
+	Ifindex      uint32
 }
 
 type publishedFlowV4Key struct {
@@ -191,10 +204,11 @@ type egressEndpointV4Key struct {
 }
 
 type egressEndpointV4Value struct {
-	HostIP uint32
-	Flags  uint8
-	Pad1   uint8
-	Pad2   uint16
+	HostIP  uint32
+	Flags   uint8
+	Pad1    uint8
+	Pad2    uint16
+	Ifindex uint32
 }
 
 type egressEndpointV6Key struct {
@@ -202,10 +216,11 @@ type egressEndpointV6Key struct {
 }
 
 type egressEndpointV6Value struct {
-	HostIP [16]byte
-	Flags  uint8
-	Pad1   uint8
-	Pad2   uint16
+	HostIP  [16]byte
+	Flags   uint8
+	Pad1    uint8
+	Pad2    uint16
+	Ifindex uint32
 }
 
 type egressFlowV4Key struct {
@@ -220,6 +235,7 @@ type egressFlowV4Key struct {
 
 type egressFlowV4Value struct {
 	EndpointIP uint32
+	Ifindex    uint32
 }
 
 type egressFlowV6Key struct {
@@ -234,6 +250,7 @@ type egressFlowV6Key struct {
 
 type egressFlowV6Value struct {
 	EndpointIP [16]byte
+	Ifindex    uint32
 }
 
 type egressIfaceValue struct {
@@ -262,10 +279,13 @@ func newEBPFPublishedPortDatapath(_ context.Context, scope string) (publishedPor
 	}
 
 	dp := &ebpfPublishedPortDatapath{
-		handles:           handles,
-		globalIfindices:   map[int]struct{}{},
-		parentLinks:       map[string][]link.Link{},
-		parentAttachments: map[string][]publishedPortTCXAttachment{},
+		handles:                    handles,
+		globalIfindices:            map[int]struct{}{},
+		parentLinks:                map[string][]link.Link{},
+		parentAttachments:          map[string][]publishedPortTCXAttachment{},
+		endpointLinks:              map[string][]link.Link{},
+		publishedEndpointIfindexV4: map[uint32]uint32{},
+		publishedEndpointIfindexV6: map[[16]byte]uint32{},
 	}
 	defer func() {
 		if err != nil {
@@ -470,6 +490,66 @@ func (d *ebpfPublishedPortDatapath) attach(ifindex int, attachType ebpf.AttachTy
 	return lnk, nil
 }
 
+func (d *ebpfPublishedPortDatapath) AttachEndpoint(hostIf string) error {
+	if strings.TrimSpace(hostIf) == "" {
+		return nil
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, ok := d.endpointLinks[hostIf]; ok {
+		return nil
+	}
+
+	hostLink, err := hostLinkByName(hostIf)
+	if err != nil {
+		return fmt.Errorf("resolve netkit primary %q: %w", hostIf, err)
+	}
+	ifindex := hostLink.Attrs().Index
+
+	primary, err := attachNetkit(link.NetkitOptions{
+		Interface: ifindex,
+		Program:   d.handles.EndpointPrimary,
+		Attach:    ebpf.AttachNetkitPrimary,
+	})
+	if err != nil {
+		return classifyEndpointNetkitDatapathError(
+			fmt.Sprintf("attach netkit primary program to %s", hostIf),
+			err,
+		)
+	}
+
+	peer, err := attachNetkit(link.NetkitOptions{
+		Interface: ifindex,
+		Program:   d.handles.EndpointPeer,
+		Attach:    ebpf.AttachNetkitPeer,
+	})
+	if err != nil {
+		_ = primary.Close()
+		return classifyEndpointNetkitDatapathError(
+			fmt.Sprintf("attach netkit peer program to %s", hostIf),
+			err,
+		)
+	}
+
+	d.endpointLinks[hostIf] = []link.Link{primary, peer}
+	return nil
+}
+
+func (d *ebpfPublishedPortDatapath) DetachEndpoint(hostIf string) error {
+	if strings.TrimSpace(hostIf) == "" {
+		return nil
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	links := d.endpointLinks[hostIf]
+	delete(d.endpointLinks, hostIf)
+	return closeLinks(links)
+}
+
 func (d *ebpfPublishedPortDatapath) AddBindings(bindings []portmapperapi.PortBinding) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -482,6 +562,9 @@ func (d *ebpfPublishedPortDatapath) AddBindings(bindings []portmapperapi.PortBin
 				errs = append(errs, err)
 				continue
 			}
+			if ifindex, ok := d.publishedEndpointIfindexV4[value.EndpointIP]; ok {
+				value.Ifindex = ifindex
+			}
 			if err := d.handles.PublishedPortsV4.Put(key, value); err != nil {
 				errs = append(errs, fmt.Errorf("program published-port ipv4 map for %s: %w", binding, err))
 			}
@@ -493,8 +576,68 @@ func (d *ebpfPublishedPortDatapath) AddBindings(bindings []portmapperapi.PortBin
 			errs = append(errs, err)
 			continue
 		}
+		if ifindex, ok := d.publishedEndpointIfindexV6[value.EndpointIP]; ok {
+			value.Ifindex = ifindex
+		}
 		if err := d.handles.PublishedPortsV6.Put(key, value); err != nil {
 			errs = append(errs, fmt.Errorf("program published-port ipv6 map for %s: %w", binding, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (d *ebpfPublishedPortDatapath) AddPublishedEndpoint(ep publishedEndpointConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if strings.TrimSpace(ep.HostIf) == "" {
+		return fmt.Errorf("published endpoint host interface is empty")
+	}
+	link, err := hostLinkByName(ep.HostIf)
+	if err != nil {
+		return fmt.Errorf("resolve published endpoint host interface %q: %w", ep.HostIf, err)
+	}
+	ifindex := uint32(link.Attrs().Index)
+
+	var errs []error
+	if ep.Addr != nil {
+		key, err := publishedEndpointKeyV4(ep.Addr)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			d.publishedEndpointIfindexV4[key] = ifindex
+		}
+	}
+	if ep.Addrv6 != nil {
+		key, err := publishedEndpointKeyV6(ep.Addrv6)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			d.publishedEndpointIfindexV6[key] = ifindex
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (d *ebpfPublishedPortDatapath) RemovePublishedEndpoint(ep publishedEndpointConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var errs []error
+	if ep.Addr != nil {
+		key, err := publishedEndpointKeyV4(ep.Addr)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			delete(d.publishedEndpointIfindexV4, key)
+		}
+	}
+	if ep.Addrv6 != nil {
+		key, err := publishedEndpointKeyV6(ep.Addrv6)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			delete(d.publishedEndpointIfindexV6, key)
 		}
 	}
 	return errors.Join(errs...)
@@ -503,6 +646,14 @@ func (d *ebpfPublishedPortDatapath) AddBindings(bindings []portmapperapi.PortBin
 func (d *ebpfPublishedPortDatapath) UpsertEgressEndpoint(ep egressEndpointConfig) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if strings.TrimSpace(ep.HostIf) != "" {
+		link, err := hostLinkByName(ep.HostIf)
+		if err != nil {
+			return fmt.Errorf("resolve egress endpoint host interface %q: %w", ep.HostIf, err)
+		}
+		ep.EndpointIfindex = uint32(link.Attrs().Index)
+	}
 
 	var errs []error
 	if ep.Addr != nil {
@@ -902,6 +1053,10 @@ func (d *ebpfPublishedPortDatapath) Close() error {
 	}
 	d.parentLinks = map[string][]link.Link{}
 	d.parentAttachments = map[string][]publishedPortTCXAttachment{}
+	for hostIf, links := range d.endpointLinks {
+		errs = append(errs, closeLinks(links))
+		delete(d.endpointLinks, hostIf)
+	}
 	errs = append(errs, closeLinks(d.globalLinks))
 	d.globalLinks = nil
 	for ifindex := range d.globalIfindices {
@@ -939,6 +1094,8 @@ func (h *netkitPortmapHandles) Close() error {
 		closeProgram(h.Connect4),
 		closeProgram(h.PortmapIngress),
 		closeProgram(h.PortmapEgress),
+		closeProgram(h.EndpointPrimary),
+		closeProgram(h.EndpointPeer),
 	)
 }
 
@@ -1002,6 +1159,17 @@ func publishedPortEntryV4(binding portmapperapi.PortBinding) (publishedPortV4Key
 	}, nil
 }
 
+func publishedEndpointKeyV4(addr *net.IPNet) (uint32, error) {
+	if addr == nil || addr.IP == nil {
+		return 0, fmt.Errorf("missing ipv4 published endpoint address")
+	}
+	ip4 := addr.IP.To4()
+	if ip4 == nil {
+		return 0, fmt.Errorf("invalid ipv4 published endpoint address %s", addr)
+	}
+	return binary.BigEndian.Uint32(ip4), nil
+}
+
 func egressEndpointKeyV4(addr *net.IPNet) (egressEndpointV4Key, error) {
 	if addr == nil || addr.IP == nil {
 		return egressEndpointV4Key{}, fmt.Errorf("missing ipv4 endpoint address")
@@ -1024,7 +1192,7 @@ func egressEndpointEntryV4(ep egressEndpointConfig) (egressEndpointV4Key, egress
 	if !ep.MasqueradeIPv4 && ep.HostIPv4 == nil {
 		return key, egressEndpointV4Value{}, false, nil
 	}
-	value := egressEndpointV4Value{}
+	value := egressEndpointV4Value{Ifindex: ep.EndpointIfindex}
 	if ep.MasqueradeIPv4 {
 		value.Flags = egressEndpointFlagMasquerade
 	} else if ip4 := ep.HostIPv4.To4(); ip4 != nil {
@@ -1059,7 +1227,7 @@ func egressEndpointEntryV6(ep egressEndpointConfig) (egressEndpointV6Key, egress
 	if !ep.MasqueradeIPv6 && ep.HostIPv6 == nil {
 		return key, egressEndpointV6Value{}, false, nil
 	}
-	value := egressEndpointV6Value{}
+	value := egressEndpointV6Value{Ifindex: ep.EndpointIfindex}
 	if ep.MasqueradeIPv6 {
 		value.Flags = egressEndpointFlagMasquerade
 	} else if ip6 := ep.HostIPv6.To16(); ip6 != nil && ep.HostIPv6.To4() == nil {
@@ -1086,6 +1254,19 @@ func publishedPortEntryV6(binding portmapperapi.PortBinding) (publishedPortV6Key
 		EndpointPort: binding.Port,
 		Flags:        uint16(bindingFlags(binding)),
 	}, nil
+}
+
+func publishedEndpointKeyV6(addr *net.IPNet) ([16]byte, error) {
+	if addr == nil || addr.IP == nil {
+		return [16]byte{}, fmt.Errorf("missing ipv6 published endpoint address")
+	}
+	ip6 := addr.IP.To16()
+	if ip6 == nil || addr.IP.To4() != nil {
+		return [16]byte{}, fmt.Errorf("invalid ipv6 published endpoint address %s", addr)
+	}
+	var key [16]byte
+	copy(key[:], ip6)
+	return key, nil
 }
 
 func publishedPortKeyV4FromBinding(binding portmapperapi.PortBinding) (publishedPortV4Key, error) {
