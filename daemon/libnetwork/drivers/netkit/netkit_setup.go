@@ -23,11 +23,19 @@ func createNetkit(hostIfName, containerIfName, parent, sboxKey string, mac net.H
 	}
 	defer netnsh.Close()
 
+	// Scrub and PeerScrub must be set explicitly: the netlink library
+	// always serialises these attributes, and the Go zero value maps to
+	// NETKIT_SCRUB_NONE, which would silently override the kernel's
+	// NETKIT_SCRUB_DEFAULT and leak skb->mark / skb->priority across
+	// netns. These attributes are create-time only and cannot be changed
+	// after the device exists.
 	nk := &netlink.Netkit{
 		LinkAttrs:  netlink.LinkAttrs{Name: hostIfName, TxQLen: 0},
 		Mode:       netlink.NETKIT_MODE_L3,
 		Policy:     netlink.NETKIT_POLICY_BLACKHOLE,
 		PeerPolicy: netlink.NETKIT_POLICY_BLACKHOLE,
+		Scrub:      netlink.NETKIT_SCRUB_DEFAULT,
+		PeerScrub:  netlink.NETKIT_SCRUB_DEFAULT,
 	}
 
 	peerAttrs := &netlink.LinkAttrs{

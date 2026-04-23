@@ -259,6 +259,8 @@ func (d *driver) probeNetkitSupport() (retErr error) {
 		Mode:       netlink.NETKIT_MODE_L3,
 		Policy:     netlink.NETKIT_POLICY_BLACKHOLE,
 		PeerPolicy: netlink.NETKIT_POLICY_BLACKHOLE,
+		Scrub:      netlink.NETKIT_SCRUB_DEFAULT,
+		PeerScrub:  netlink.NETKIT_SCRUB_DEFAULT,
 	}
 	probe.SetPeerAttrs(&netlink.LinkAttrs{Name: peerName, TxQLen: 0})
 
