@@ -89,13 +89,6 @@ func (d *driver) populateEndpoints() error {
 			continue
 		}
 		n.endpoints[ep.id] = ep
-		if err := d.attachEndpointDatapath(context.TODO(), ep); err != nil {
-			log.G(context.TODO()).WithFields(log.Fields{
-				"error": err,
-				"ep.id": ep.id,
-				"nid":   ep.nid,
-			}).Warn("Failed to attach netkit endpoint datapath during restore")
-		}
 		if err := d.upsertEgressEndpointDatapath(context.TODO(), n, ep); err != nil {
 			log.G(context.TODO()).WithFields(log.Fields{
 				"error": err,
@@ -109,6 +102,13 @@ func (d *driver) populateEndpoints() error {
 				"ep.id": ep.id,
 				"nid":   ep.nid,
 			}).Warn("Failed to restore netkit published ports")
+		}
+		if err := d.attachEndpointDatapath(context.TODO(), ep); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error": err,
+				"ep.id": ep.id,
+				"nid":   ep.nid,
+			}).Warn("Failed to attach netkit endpoint datapath during restore")
 		}
 	}
 
@@ -160,10 +160,12 @@ func (d *driver) restorePublishedPorts(ctx context.Context, ep *endpoint) error 
 	}()
 
 	portMapping, err := rt.ReconcilePortBindings(ctx, publishedPortRequest{
-		Addr:         ep.addr,
-		Addrv6:       ep.addrv6,
-		PortBindings: reqs,
-		DesiredMode:  mode,
+		Addr:           ep.addr,
+		Addrv6:         ep.addrv6,
+		PortBindings:   reqs,
+		DesiredMode:    mode,
+		DisableNATIPv4: n.config.GwModeIPv4.routed(),
+		DisableNATIPv6: n.config.GwModeIPv6.routed(),
 	})
 	if err != nil {
 		return err

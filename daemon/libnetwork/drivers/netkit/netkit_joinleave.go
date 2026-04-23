@@ -192,32 +192,16 @@ func (d *driver) Leave(nid, eid string) error {
 		return err
 	}
 
-	if ep.publishedParent != "" {
-		pr := d.parents[ep.publishedParent]
-		if pr != nil {
-			if len(ep.portMapping) != 0 {
-				if err := pr.runtime.ReleasePortBindings(context.TODO(), ep.portMapping); err != nil {
-					return err
-				}
-			}
-			if err := pr.runtime.DelEndpoint(context.TODO(), publishedEndpointConfigForEndpoint(ep)); err != nil {
-				return err
-			}
-			if err := d.releaseParentRuntimeLocked(context.TODO(), ep.publishedParent); err != nil {
-				return err
-			}
-		}
+	if err := d.releaseEndpointPublishedPortsLocked(context.TODO(), ep); err != nil {
+		return err
 	}
 
 	if err := removeEndpointRoutes(ep); err != nil {
 		return err
 	}
-	if err := d.removeEgressEndpointDatapath(ep); err != nil {
+	if err := d.removeEgressEndpointDatapathLocked(ep); err != nil {
 		return err
 	}
-	ep.portMapping = nil
-	ep.portBindingState = portBindingMode{}
-	ep.publishedParent = ""
 	if err := d.storeUpdate(ep); err != nil {
 		return fmt.Errorf("failed to save netkit endpoint %.7s during leave: %v", ep.id, err)
 	}

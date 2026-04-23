@@ -89,9 +89,13 @@ func (d *driver) upsertEgressEndpointDatapath(ctx context.Context, n *network, e
 		return nil
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
 
+	return d.upsertEgressEndpointDatapathLocked(ctx, n, ep, config)
+}
+
+func (d *driver) upsertEgressEndpointDatapathLocked(ctx context.Context, n *network, ep *endpoint, config egressEndpointConfig) error {
 	if d.datapathEndpoints == nil {
 		d.datapathEndpoints = map[string]struct{}{}
 	}
@@ -104,6 +108,7 @@ func (d *driver) upsertEgressEndpointDatapath(ctx context.Context, n *network, e
 		if created && len(d.parents) == 0 && len(d.datapathEndpoints) == 0 {
 			_ = datapath.Close()
 			d.datapath = nil
+			d.sharedDatapathLinks = map[string]struct{}{}
 		}
 		return err
 	}
@@ -116,9 +121,13 @@ func (d *driver) removeEgressEndpointDatapath(ep *endpoint) error {
 		return nil
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
 
+	return d.removeEgressEndpointDatapathLocked(ep)
+}
+
+func (d *driver) removeEgressEndpointDatapathLocked(ep *endpoint) error {
 	if d.datapath == nil {
 		return nil
 	}
@@ -134,6 +143,7 @@ func (d *driver) removeEgressEndpointDatapath(ep *endpoint) error {
 	if len(d.parents) == 0 && len(d.datapathEndpoints) == 0 {
 		err = errors.Join(err, d.datapath.Close())
 		d.datapath = nil
+		d.sharedDatapathLinks = map[string]struct{}{}
 	}
 	return err
 }
@@ -184,12 +194,14 @@ func (d *driver) ProgramExternalConnectivity(ctx context.Context, nid, eid strin
 	}
 
 	req := publishedPortRequest{
-		Addr:         ep.addr,
-		Addrv6:       ep.addrv6,
-		PortBindings: ep.extConnConfig.PortBindings,
-		Current:      ep.portMapping,
-		CurrentMode:  ep.portBindingState,
-		DesiredMode:  desired,
+		Addr:           ep.addr,
+		Addrv6:         ep.addrv6,
+		PortBindings:   ep.extConnConfig.PortBindings,
+		Current:        ep.portMapping,
+		CurrentMode:    ep.portBindingState,
+		DesiredMode:    desired,
+		DisableNATIPv4: n.config.GwModeIPv4.routed(),
+		DisableNATIPv6: n.config.GwModeIPv6.routed(),
 	}
 	portMapping, err := pr.runtime.ReconcilePortBindings(ctx, req)
 	if err != nil {
@@ -202,6 +214,38 @@ func (d *driver) ProgramExternalConnectivity(ctx context.Context, nid, eid strin
 	if err := d.storeUpdate(ep); err != nil {
 		return fmt.Errorf("failed to save netkit endpoint %.7s during external connectivity update: %v", ep.id, err)
 	}
+	return nil
+}
+
+func (d *driver) releaseEndpointPublishedPortsLocked(ctx context.Context, ep *endpoint) error {
+	if ep == nil || ep.publishedParent == "" {
+		return nil
+	}
+
+	parent := ep.publishedParent
+	pr := d.parents[parent]
+	if pr == nil {
+		ep.portMapping = nil
+		ep.portBindingState = portBindingMode{}
+		ep.publishedParent = ""
+		return nil
+	}
+
+	if len(ep.portMapping) != 0 {
+		if err := pr.runtime.ReleasePortBindings(ctx, ep.portMapping); err != nil {
+			return err
+		}
+	}
+	if err := pr.runtime.DelEndpoint(ctx, publishedEndpointConfigForEndpoint(ep)); err != nil {
+		return err
+	}
+	if err := d.releaseParentRuntimeLocked(ctx, parent); err != nil {
+		return err
+	}
+
+	ep.portMapping = nil
+	ep.portBindingState = portBindingMode{}
+	ep.publishedParent = ""
 	return nil
 }
 
@@ -277,6 +321,7 @@ func (d *driver) releaseParentRuntimeLocked(ctx context.Context, parent string) 
 	}
 	err = errors.Join(err, d.datapath.Close())
 	d.datapath = nil
+	d.sharedDatapathLinks = map[string]struct{}{}
 	return err
 }
 
@@ -411,24 +456,36 @@ func (r *bridgePublishedPortRuntime) ReconcilePortBindings(ctx context.Context, 
 		if err != nil {
 			return nil, err
 		}
-		if err := r.datapath.AddBindings(added); err != nil {
-			_ = r.unmapPortBindings(ctx, added)
-			return nil, err
+		natAdded := natPortBindings(added)
+		if len(natAdded) != 0 {
+			if err := r.datapath.AddBindings(natAdded); err != nil {
+				_ = r.unmapPortBindings(ctx, added)
+				return nil, err
+			}
 		}
 	}
 
 	if len(toRelease) != 0 {
-		if err := r.datapath.RemoveBindings(toRelease); err != nil {
-			if len(added) != 0 {
-				_ = r.datapath.RemoveBindings(added)
-				_ = r.unmapPortBindings(ctx, added)
+		natToRelease := natPortBindings(toRelease)
+		if len(natToRelease) != 0 {
+			if err := r.datapath.RemoveBindings(natToRelease); err != nil {
+				if len(added) != 0 {
+					if natAdded := natPortBindings(added); len(natAdded) != 0 {
+						_ = r.datapath.RemoveBindings(natAdded)
+					}
+					_ = r.unmapPortBindings(ctx, added)
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 		if err := r.unmapPortBindings(ctx, toRelease); err != nil {
-			_ = r.datapath.AddBindings(toRelease)
+			if len(natToRelease) != 0 {
+				_ = r.datapath.AddBindings(natToRelease)
+			}
 			if len(added) != 0 {
-				_ = r.datapath.RemoveBindings(added)
+				if natAdded := natPortBindings(added); len(natAdded) != 0 {
+					_ = r.datapath.RemoveBindings(natAdded)
+				}
 				_ = r.unmapPortBindings(ctx, added)
 			}
 			return nil, err
@@ -443,11 +500,16 @@ func (r *bridgePublishedPortRuntime) ReleasePortBindings(ctx context.Context, bi
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if err := r.datapath.RemoveBindings(bindings); err != nil {
-		return err
+	natBindings := natPortBindings(bindings)
+	if len(natBindings) != 0 {
+		if err := r.datapath.RemoveBindings(natBindings); err != nil {
+			return err
+		}
 	}
 	if err := r.unmapPortBindings(ctx, bindings); err != nil {
-		_ = r.datapath.AddBindings(bindings)
+		if len(natBindings) != 0 {
+			_ = r.datapath.AddBindings(natBindings)
+		}
 		return err
 	}
 	for _, state := range r.endpoints {
@@ -493,8 +555,8 @@ func (r *bridgePublishedPortRuntime) expandPortBindings(req publishedPortRequest
 		if binding.HostPortEnd == 0 {
 			binding.HostPortEnd = binding.HostPort
 		}
-		if req.DesiredMode.ipv4 {
-			b4, ok, err := configureNetkitPortBindingIPv4(binding, req.Addr)
+		if req.DesiredMode.ipv4 || (req.DisableNATIPv4 && req.DesiredMode.routed) {
+			b4, ok, err := configureNetkitPortBindingIPv4(binding, req.Addr, req.DisableNATIPv4)
 			if err != nil {
 				return nil, err
 			}
@@ -502,8 +564,8 @@ func (r *bridgePublishedPortRuntime) expandPortBindings(req publishedPortRequest
 				reqs = append(reqs, b4)
 			}
 		}
-		if req.DesiredMode.ipv6 {
-			b6, ok, err := configureNetkitPortBindingIPv6(binding, req.Addrv6)
+		if req.DesiredMode.ipv6 || (req.DisableNATIPv6 && req.DesiredMode.routed) {
+			b6, ok, err := configureNetkitPortBindingIPv6(binding, req.Addrv6, req.DisableNATIPv6)
 			if err != nil {
 				return nil, err
 			}
@@ -518,7 +580,7 @@ func (r *bridgePublishedPortRuntime) expandPortBindings(req publishedPortRequest
 	return reqs, nil
 }
 
-func configureNetkitPortBindingIPv4(bnd portmapperapi.PortBindingReq, ep4 *net.IPNet) (portmapperapi.PortBindingReq, bool, error) {
+func configureNetkitPortBindingIPv4(bnd portmapperapi.PortBindingReq, ep4 *net.IPNet, disableNAT bool) (portmapperapi.PortBindingReq, bool, error) {
 	if ep4 == nil {
 		if len(bnd.HostIP) > 0 && bnd.HostIP.To4() != nil {
 			return portmapperapi.PortBindingReq{}, false, types.InvalidParameterErrorf("netkit pure eBPF port mapping only supports same-family published ports")
@@ -533,12 +595,18 @@ func configureNetkitPortBindingIPv4(bnd portmapperapi.PortBindingReq, ep4 *net.I
 	} else {
 		bnd.HostIP = bnd.HostIP.To4()
 	}
+	if disableNAT {
+		bnd.HostIP = net.IPv4zero
+	}
 	bnd.IP = ep4.IP.To4()
 	bnd.Mapper = "nat"
+	if disableNAT {
+		bnd.Mapper = "routed"
+	}
 	return bnd, true, nil
 }
 
-func configureNetkitPortBindingIPv6(bnd portmapperapi.PortBindingReq, ep6 *net.IPNet) (portmapperapi.PortBindingReq, bool, error) {
+func configureNetkitPortBindingIPv6(bnd portmapperapi.PortBindingReq, ep6 *net.IPNet, disableNAT bool) (portmapperapi.PortBindingReq, bool, error) {
 	if ep6 == nil {
 		if len(bnd.HostIP) > 0 && bnd.HostIP.To4() == nil {
 			return portmapperapi.PortBindingReq{}, false, types.InvalidParameterErrorf("netkit pure eBPF port mapping only supports same-family published ports")
@@ -549,13 +617,19 @@ func configureNetkitPortBindingIPv6(bnd portmapperapi.PortBindingReq, ep6 *net.I
 		return portmapperapi.PortBindingReq{}, false, nil
 	}
 	if len(bnd.HostIP) == 0 {
-		if !isV6Listenable() {
+		if !disableNAT && !isV6Listenable() {
 			return portmapperapi.PortBindingReq{}, false, nil
 		}
 		bnd.HostIP = net.IPv6zero
 	}
+	if disableNAT {
+		bnd.HostIP = net.IPv6zero
+	}
 	bnd.IP = cloneIP(ep6.IP)
 	bnd.Mapper = "nat"
+	if disableNAT {
+		bnd.Mapper = "routed"
+	}
 	return bnd, true, nil
 }
 
@@ -674,6 +748,12 @@ func clonePortBindings(bindings []portmapperapi.PortBinding) []portmapperapi.Por
 	res := make([]portmapperapi.PortBinding, len(bindings))
 	copy(res, bindings)
 	return res
+}
+
+func natPortBindings(bindings []portmapperapi.PortBinding) []portmapperapi.PortBinding {
+	return slices.DeleteFunc(clonePortBindings(bindings), func(binding portmapperapi.PortBinding) bool {
+		return binding.Mapper != "nat"
+	})
 }
 
 func needSamePort(a, b portmapperapi.PortBindingReq) bool {

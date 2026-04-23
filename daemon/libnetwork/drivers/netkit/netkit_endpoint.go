@@ -81,9 +81,14 @@ func (d *driver) DeleteEndpoint(nid, eid string) error {
 	if err := d.detachEndpointDatapath(ep); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("failed to detach netkit endpoint datapath for endpoint %.7s", ep.id)
 	}
-	if err := d.removeEgressEndpointDatapath(ep); err != nil {
+	d.configNetwork.Lock()
+	if err := d.releaseEndpointPublishedPortsLocked(context.TODO(), ep); err != nil {
+		log.G(context.TODO()).WithError(err).Warnf("failed to release netkit published ports for endpoint %.7s", ep.id)
+	}
+	if err := d.removeEgressEndpointDatapathLocked(ep); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("failed to remove netkit egress datapath state for endpoint %.7s", ep.id)
 	}
+	d.configNetwork.Unlock()
 	if err := removeEndpointRoutes(ep); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("failed to remove host routes for endpoint %.7s", ep.id)
 	}

@@ -17,6 +17,11 @@
 #define ETH_P_8021AD 0x88A8
 #define IP_MF 0x2000
 #define IP_OFFSET 0x1fff
+#define IPPROTO_ICMPV6 58
+#define ICMP_ECHOREPLY 0
+#define ICMP_ECHO 8
+#define ICMPV6_ECHO_REQUEST 128
+#define ICMPV6_ECHO_REPLY 129
 #define PUBLISHED_IFACE_F_REDIRECT_REPLY 0x1
 #define EGRESS_ENDPOINT_F_MASQUERADE 0x1
 
@@ -407,7 +412,19 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 			return 0;
 		}
 
-		return -1;
+		if (pkt->proto == IPPROTO_ICMP) {
+			struct icmphdr *icmph = data + pkt->l4_off;
+
+			if ((void *)(icmph + 1) > data_end)
+				return -1;
+			pkt->l4_csum_off = pkt->l4_off + offsetof(struct icmphdr, checksum);
+			if (icmph->type == ICMP_ECHO || icmph->type == ICMP_ECHOREPLY) {
+				pkt->sport = icmph->un.echo.id;
+				pkt->dport = icmph->un.echo.id;
+			}
+		}
+
+		return 0;
 	}
 
 	if (l3_proto == bpf_htons(ETH_P_IPV6)) {
@@ -447,6 +464,21 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 			pkt->l4_csum_off = pkt->l4_off + offsetof(struct udphdr, check);
 			return 0;
 		}
+
+		if (pkt->proto == IPPROTO_ICMPV6) {
+			struct icmp6hdr *icmp6h = data + pkt->l4_off;
+
+			if ((void *)(icmp6h + 1) > data_end)
+				return -1;
+			pkt->l4_csum_off = pkt->l4_off + offsetof(struct icmp6hdr, icmp6_cksum);
+			if (icmp6h->icmp6_type == ICMPV6_ECHO_REQUEST ||
+			    icmp6h->icmp6_type == ICMPV6_ECHO_REPLY) {
+				pkt->sport = icmp6h->icmp6_dataun.u_echo.identifier;
+				pkt->dport = icmp6h->icmp6_dataun.u_echo.identifier;
+			}
+		}
+
+		return 0;
 	}
 
 	return -1;
@@ -677,6 +709,28 @@ static __always_inline int replace_ipv4_addr(struct __sk_buff *skb, __u32 csum_o
 	return bpf_skb_store_bytes(skb, addr_off, &new_addr, sizeof(new_addr), 0);
 }
 
+static __always_inline int replace_ipv4_addr_l3(struct __sk_buff *skb, __u32 addr_off,
+						__u32 ip_csum_off, __be32 old_addr,
+						__be32 new_addr)
+{
+	if (bpf_l3_csum_replace(skb, ip_csum_off, old_addr, new_addr, sizeof(old_addr)) < 0)
+		return -1;
+	return bpf_skb_store_bytes(skb, addr_off, &new_addr, sizeof(new_addr), 0);
+}
+
+static __always_inline int replace_ipv4_addr_for_packet(struct __sk_buff *skb,
+							const struct packet_info *pkt,
+							__u32 addr_off, __be32 old_addr,
+							__be32 new_addr)
+{
+	if (pkt->proto == IPPROTO_TCP || pkt->proto == IPPROTO_UDP)
+		return replace_ipv4_addr(skb, pkt->l4_csum_off, addr_off,
+					 pkt->l3_off + offsetof(struct iphdr, check),
+					 old_addr, new_addr, 1);
+	return replace_ipv4_addr_l3(skb, addr_off, pkt->l3_off + offsetof(struct iphdr, check),
+				    old_addr, new_addr);
+}
+
 static __always_inline int replace_ipv6_addr(struct __sk_buff *skb, __u32 csum_off, __u32 addr_off,
 					     const __u8 old_addr[16], const __u8 new_addr[16])
 {
@@ -696,6 +750,18 @@ static __always_inline int replace_ipv6_addr(struct __sk_buff *skb, __u32 csum_o
 				BPF_F_PSEUDO_HDR | sizeof(old32[0]) | BPF_F_MARK_MANGLED_0) < 0)
 		return -1;
 	return bpf_skb_store_bytes(skb, addr_off, new_addr, 16, 0);
+}
+
+static __always_inline int replace_ipv6_addr_for_packet(struct __sk_buff *skb,
+							const struct packet_info *pkt,
+							__u32 addr_off,
+							const __u8 old_addr[16],
+							const __u8 new_addr[16])
+{
+	if (pkt->proto != IPPROTO_TCP && pkt->proto != IPPROTO_UDP &&
+	    pkt->proto != IPPROTO_ICMPV6)
+		return -1;
+	return replace_ipv6_addr(skb, pkt->l4_csum_off, addr_off, old_addr, new_addr);
 }
 
 static __always_inline int replace_l4_port(struct __sk_buff *skb, const struct packet_info *pkt,
@@ -778,8 +844,8 @@ static __always_inline int apply_egress_snat_v4(struct __sk_buff *skb, const str
 {
 	__be32 new_addr = bpf_htonl(host_ip);
 
-	return replace_ipv4_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct iphdr, saddr),
-				 pkt->l3_off + offsetof(struct iphdr, check), pkt->saddr4, new_addr, 1);
+	return replace_ipv4_addr_for_packet(skb, pkt, pkt->l3_off + offsetof(struct iphdr, saddr),
+					    pkt->saddr4, new_addr);
 }
 
 static __always_inline int rewrite_egress_snat_v4(struct __sk_buff *skb, const struct packet_info *pkt,
@@ -793,8 +859,8 @@ static __always_inline int rewrite_egress_snat_v4(struct __sk_buff *skb, const s
 static __always_inline int apply_egress_snat_v6(struct __sk_buff *skb, const struct packet_info *pkt,
 						const __u8 host_ip[16])
 {
-	return replace_ipv6_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct ipv6hdr, saddr),
-				 pkt->saddr6.in6_u.u6_addr8, host_ip);
+	return replace_ipv6_addr_for_packet(skb, pkt, pkt->l3_off + offsetof(struct ipv6hdr, saddr),
+					    pkt->saddr6.in6_u.u6_addr8, host_ip);
 }
 
 static __always_inline int rewrite_egress_snat_v6(struct __sk_buff *skb, const struct packet_info *pkt,
@@ -810,8 +876,8 @@ static __always_inline int rewrite_egress_return_v4(struct __sk_buff *skb, const
 {
 	__be32 new_addr = bpf_htonl(value->endpoint_ip);
 
-	if (replace_ipv4_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct iphdr, daddr),
-			      pkt->l3_off + offsetof(struct iphdr, check), pkt->daddr4, new_addr, 1) < 0)
+	if (replace_ipv4_addr_for_packet(skb, pkt, pkt->l3_off + offsetof(struct iphdr, daddr),
+					 pkt->daddr4, new_addr) < 0)
 		return TCX_NEXT;
 	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
 		return bpf_redirect_peer(value->ifindex, 0);
@@ -821,8 +887,8 @@ static __always_inline int rewrite_egress_return_v4(struct __sk_buff *skb, const
 static __always_inline int rewrite_egress_return_v6(struct __sk_buff *skb, const struct packet_info *pkt,
 						    const struct egress_flow_v6_value *value)
 {
-	if (replace_ipv6_addr(skb, pkt->l4_csum_off, pkt->l3_off + offsetof(struct ipv6hdr, daddr),
-			      pkt->daddr6.in6_u.u6_addr8, value->endpoint_ip) < 0)
+	if (replace_ipv6_addr_for_packet(skb, pkt, pkt->l3_off + offsetof(struct ipv6hdr, daddr),
+					 pkt->daddr6.in6_u.u6_addr8, value->endpoint_ip) < 0)
 		return TCX_NEXT;
 	if (value->ifindex != 0 && value->ifindex != skb->ifindex)
 		return bpf_redirect_peer(value->ifindex, 0);
@@ -1252,8 +1318,10 @@ static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u
 		}
 
 		netkit_dbg("host egress4 snat host=%x", host_ip);
+		if (apply_egress_snat_v4(skb, &pkt, host_ip) < 0)
+			return TCX_NEXT;
 		remember_egress_flow_v4(&pkt, host_ip, 0);
-		return rewrite_egress_snat_v4(skb, &pkt, host_ip);
+		return TCX_NEXT;
 	}
 
 	if (pkt.family == AF_INET6) {
@@ -1268,8 +1336,10 @@ static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u
 		if (resolve_egress_ipv6(ifindex, endpoint, host_ip) < 0)
 			return TCX_NEXT;
 
+		if (apply_egress_snat_v6(skb, &pkt, host_ip) < 0)
+			return TCX_NEXT;
 		remember_egress_flow_v6(&pkt, host_ip, 0);
-		return rewrite_egress_snat_v6(skb, &pkt, host_ip);
+		return TCX_NEXT;
 	}
 
 	return TCX_NEXT;
@@ -1305,11 +1375,11 @@ static __always_inline int redirect_endpoint_egress_v4(struct __sk_buff *skb,
 		return TCX_NEXT;
 	}
 
-	remember_egress_flow_v4(pkt, host_ip, endpoint->ifindex);
 	if (apply_egress_snat_v4(skb, pkt, host_ip) < 0) {
 		netkit_dbg("endpoint egress4 snat fail host=%x out_if=%d", host_ip, fib.ifindex);
 		return TCX_NEXT;
 	}
+	remember_egress_flow_v4(pkt, host_ip, endpoint->ifindex);
 
 	neigh.nh_family = AF_INET;
 	neigh.ipv4_nh = fib.ipv4_dst;
@@ -1346,11 +1416,11 @@ static __always_inline int redirect_endpoint_egress_v6(struct __sk_buff *skb,
 		return TCX_NEXT;
 	}
 
-	remember_egress_flow_v6(pkt, host_ip, endpoint->ifindex);
 	if (apply_egress_snat_v6(skb, pkt, host_ip) < 0) {
 		netkit_dbg("endpoint egress6 snat fail out_if=%d", fib.ifindex);
 		return TCX_NEXT;
 	}
+	remember_egress_flow_v6(pkt, host_ip, endpoint->ifindex);
 
 	neigh.nh_family = AF_INET6;
 	__builtin_memcpy(neigh.ipv6_nh, fib.ipv6_dst, sizeof(neigh.ipv6_nh));

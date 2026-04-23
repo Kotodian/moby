@@ -18,6 +18,7 @@ import (
 	"github.com/moby/moby/v2/daemon/libnetwork/netlabel"
 	"github.com/moby/moby/v2/daemon/libnetwork/netutils"
 	"github.com/moby/moby/v2/daemon/libnetwork/portmapperapi"
+	"github.com/moby/moby/v2/daemon/libnetwork/portmappers/routed"
 	"github.com/moby/moby/v2/daemon/libnetwork/types"
 	"github.com/moby/moby/v2/internal/sliceutil"
 	"github.com/moby/moby/v2/internal/testutil/storeutils"
@@ -839,6 +840,27 @@ func TestLeaveRemovesEgressMasqueradeState(t *testing.T) {
 	assert.Check(t, is.Equal(datapath.closeCalls, 1))
 }
 
+func TestAttachEndpointDatapathUsesStandaloneForUnreferencedEndpoint(t *testing.T) {
+	sharedDatapath := &fakePublishedPortDatapath{}
+	standaloneDatapath := &fakeEndpointNetkitDatapath{}
+	d := &driver{
+		datapath:         sharedDatapath,
+		endpointDatapath: standaloneDatapath,
+		datapathEndpoints: map[string]struct{}{
+			"dummy/referenced": {},
+		},
+	}
+	ep := &endpoint{
+		id:     "unreferenced",
+		nid:    "dummy",
+		hostIf: "nkstandalone0",
+	}
+
+	assert.NilError(t, d.attachEndpointDatapath(context.Background(), ep))
+	assert.DeepEqual(t, standaloneDatapath.attached, []string{"nkstandalone0"})
+	assert.DeepEqual(t, sharedDatapath.attached, []string(nil))
+}
+
 func TestJoinAndProgramExternalConnectivityPublishesPorts(t *testing.T) {
 	store := storeutils.NewTempStore(t)
 	runtime := &fakePublishedPortRuntime{}
@@ -1319,6 +1341,54 @@ func TestPopulateEndpointsRestoresPublishedPorts(t *testing.T) {
 	assert.DeepEqual(t, epDatapath.attached, []string{"nkhost0"})
 }
 
+func TestPopulateEndpointsRestoresEgressBeforeAttachingSharedDatapath(t *testing.T) {
+	store := storeutils.NewTempStore(t)
+	restored := &endpoint{
+		id:      "ep1",
+		nid:     "n1",
+		srcName: "nkcont0",
+		hostIf:  "nkhost0",
+		addr:    mustParseCIDR(t, "172.30.0.11/24"),
+	}
+	assert.NilError(t, store.PutObjectAtomic(restored))
+
+	sharedDatapath := &fakePublishedPortDatapath{}
+	standaloneDatapath := &fakeEndpointNetkitDatapath{}
+	newPublishedPortDatapathSaved := newPublishedPortDatapath
+	newPublishedPortDatapath = func(context.Context, string) (publishedPortDatapath, error) {
+		return sharedDatapath, nil
+	}
+	defer func() {
+		newPublishedPortDatapath = newPublishedPortDatapathSaved
+	}()
+
+	d := &driver{
+		store: store,
+		newEndpointDatapath: func(context.Context) (endpointNetkitDatapath, error) {
+			return standaloneDatapath, nil
+		},
+		networks: map[string]*network{
+			"n1": {
+				id: "n1",
+				config: &configuration{
+					ID:                 "n1",
+					EnableIPMasquerade: true,
+					GwModeIPv4:         gwModeNAT,
+				},
+				endpoints: map[string]*endpoint{},
+			},
+		},
+		parents:           map[string]*parentRuntime{},
+		datapathEndpoints: map[string]struct{}{},
+	}
+
+	assert.NilError(t, d.populateEndpoints())
+	assert.DeepEqual(t, sharedDatapath.attached, []string{"nkhost0"})
+	assert.DeepEqual(t, standaloneDatapath.attached, []string(nil))
+	assert.Assert(t, is.Len(sharedDatapath.upsertedEndpoints, 1))
+	assert.Check(t, sharedDatapath.upsertedEndpoints[0].Addr.IP.Equal(net.ParseIP("172.30.0.11")))
+}
+
 func TestBridgePublishedPortRuntimeAllocatesIPv4PublishedPorts(t *testing.T) {
 	datapath := &fakePublishedPortDatapath{}
 	newPublishedPortDatapathSaved := newPublishedPortDatapath
@@ -1360,6 +1430,102 @@ func TestBridgePublishedPortRuntimeAllocatesIPv4PublishedPorts(t *testing.T) {
 	assert.Check(t, is.Equal(natPM.reqs[0][0].HostPort, uint16(8080)))
 	assert.Check(t, is.Equal(len(datapath.added), 1))
 	assert.Check(t, is.Equal(datapath.added[0][0].HostPort, uint16(8080)))
+}
+
+func TestBridgePublishedPortRuntimeUsesRoutedMapperWhenNATDisabled(t *testing.T) {
+	datapath := &fakePublishedPortDatapath{}
+	pms := &drvregistry.PortMappers{}
+	assert.NilError(t, pms.Register("nat", &stubPortMapper{}))
+	assert.NilError(t, routed.Register(pms))
+
+	rtAny, err := newBridgePublishedPortRuntimeWithDatapath("net1", pms, datapath, false)
+	assert.NilError(t, err)
+	rt := rtAny.(*bridgePublishedPortRuntime)
+
+	ep4 := mustParseCIDR(t, "172.30.0.11/24")
+	assert.NilError(t, rt.AddEndpoint(context.Background(), publishedEndpointConfig{HostIf: "nk123", Addr: ep4}))
+
+	pbs, err := rt.ReconcilePortBindings(context.Background(), publishedPortRequest{
+		Addr: ep4,
+		PortBindings: []portmapperapi.PortBindingReq{{
+			PortBinding: types.PortBinding{
+				Proto:    types.TCP,
+				Port:     80,
+				HostIP:   net.ParseIP("192.0.2.10"),
+				HostPort: 8080,
+			},
+		}},
+		DesiredMode:    portBindingMode{routed: true},
+		DisableNATIPv4: true,
+	})
+	assert.NilError(t, err)
+	assert.Assert(t, is.Len(pbs, 1))
+	assert.Check(t, is.Equal(pbs[0].Mapper, "routed"))
+	assert.Check(t, pbs[0].Forwarding)
+	assert.Check(t, pbs[0].HostIP.Equal(net.IPv4zero))
+	assert.Check(t, is.Equal(pbs[0].HostPort, uint16(0)))
+	assert.Check(t, is.Len(datapath.added, 0))
+}
+
+func TestDeleteNetworkReleasesPublishedPorts(t *testing.T) {
+	runtime := &fakePublishedPortRuntime{}
+	d := &driver{
+		networks: map[string]*network{},
+		parents: map[string]*parentRuntime{
+			"n1": {
+				parent:  "n1",
+				runtime: runtime,
+				refs:    1,
+			},
+		},
+		datapathEndpoints: map[string]struct{}{},
+	}
+	nw := &network{
+		id:     "n1",
+		driver: d,
+		config: &configuration{ID: "n1"},
+		endpoints: map[string]*endpoint{
+			"ep1": {
+				id:              "ep1",
+				nid:             "n1",
+				hostIf:          "nkhost0",
+				addr:            mustParseCIDR(t, "172.30.0.11/24"),
+				publishedParent: "n1",
+				portBindingState: portBindingMode{
+					routed: true,
+					ipv4:   true,
+				},
+				portMapping: []portmapperapi.PortBinding{{
+					PortBinding: types.PortBinding{
+						Proto:    types.TCP,
+						IP:       net.ParseIP("172.30.0.11"),
+						Port:     80,
+						HostIP:   net.IPv4zero,
+						HostPort: 8080,
+					},
+					Mapper: "nat",
+				}},
+			},
+		},
+	}
+	d.networks[nw.id] = nw
+
+	hostLinkByNameSaved := hostLinkByName
+	deleteHostRouteSaved := deleteHostRoute
+	hostLinkByName = func(name string) (netlink.Link, error) {
+		return &netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: name, Index: 7}}, nil
+	}
+	deleteHostRoute = func(*netlink.Route) error { return nil }
+	defer func() {
+		hostLinkByName = hostLinkByNameSaved
+		deleteHostRoute = deleteHostRouteSaved
+	}()
+
+	assert.NilError(t, d.DeleteNetwork("n1"))
+	assert.Check(t, is.Equal(len(runtime.released), 1))
+	assert.Check(t, is.Equal(runtime.delEndpointCalls, 1))
+	assert.Check(t, is.Equal(runtime.closeCalls, 1))
+	assert.Check(t, is.Equal(len(d.parents), 0))
 }
 
 func TestBridgePublishedPortRuntimeProgramsPublishedEndpointForRedirect(t *testing.T) {

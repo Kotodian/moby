@@ -188,12 +188,22 @@ func (d *driver) attachEndpointDatapath(ctx context.Context, ep *endpoint) error
 		return nil
 	}
 
-	d.mu.Lock()
-	if d.datapath != nil {
+	d.configNetwork.Lock()
+	if d.datapath != nil && d.endpointUsesSharedDatapathLocked(ep) {
 		dp := d.datapath
-		d.mu.Unlock()
-		return dp.AttachEndpoint(ep.hostIf)
+		if d.sharedDatapathLinks == nil {
+			d.sharedDatapathLinks = map[string]struct{}{}
+		}
+		err := dp.AttachEndpoint(ep.hostIf)
+		if err == nil {
+			d.sharedDatapathLinks[endpointDatapathKey(ep)] = struct{}{}
+		}
+		d.configNetwork.Unlock()
+		return err
 	}
+	d.configNetwork.Unlock()
+
+	d.mu.Lock()
 	dp := d.endpointDatapath
 	if dp == nil {
 		ctor := d.newEndpointDatapath
@@ -218,16 +228,34 @@ func (d *driver) detachEndpointDatapath(ep *endpoint) error {
 		return nil
 	}
 
-	d.mu.Lock()
-	if d.datapath != nil {
+	d.configNetwork.Lock()
+	if _, ok := d.sharedDatapathLinks[endpointDatapathKey(ep)]; ok {
 		dp := d.datapath
-		d.mu.Unlock()
+		delete(d.sharedDatapathLinks, endpointDatapathKey(ep))
+		d.configNetwork.Unlock()
+		if dp == nil {
+			return nil
+		}
 		return dp.DetachEndpoint(ep.hostIf)
 	}
+	d.configNetwork.Unlock()
+
+	d.mu.Lock()
 	dp := d.endpointDatapath
 	d.mu.Unlock()
 	if dp == nil {
 		return nil
 	}
 	return dp.DetachEndpoint(ep.hostIf)
+}
+
+func (d *driver) endpointUsesSharedDatapathLocked(ep *endpoint) bool {
+	if ep == nil {
+		return false
+	}
+	if ep.publishedParent != "" {
+		return true
+	}
+	_, ok := d.datapathEndpoints[endpointDatapathKey(ep)]
+	return ok
 }

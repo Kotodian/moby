@@ -25,6 +25,7 @@ type driver struct {
 	newPortRuntime      func(context.Context, string) (publishedPortRuntime, error)
 	datapath            publishedPortDatapath
 	datapathEndpoints   map[string]struct{}
+	sharedDatapathLinks map[string]struct{}
 	newEndpointDatapath func(context.Context) (endpointNetkitDatapath, error)
 	endpointDatapath    endpointNetkitDatapath
 
@@ -78,12 +79,14 @@ type portBindingMode struct {
 }
 
 type publishedPortRequest struct {
-	Addr         *net.IPNet
-	Addrv6       *net.IPNet
-	PortBindings []portmapperapi.PortBindingReq
-	Current      []portmapperapi.PortBinding
-	CurrentMode  portBindingMode
-	DesiredMode  portBindingMode
+	Addr           *net.IPNet
+	Addrv6         *net.IPNet
+	PortBindings   []portmapperapi.PortBindingReq
+	Current        []portmapperapi.PortBinding
+	CurrentMode    portBindingMode
+	DesiredMode    portBindingMode
+	DisableNATIPv4 bool
+	DisableNATIPv6 bool
 }
 
 type publishedEndpointConfig struct {
@@ -109,12 +112,13 @@ type parentRuntime struct {
 
 func Register(r driverapi.Registerer, store *datastore.Store, pms *drvregistry.PortMappers, config bridge.Configuration) error {
 	d := &driver{
-		store:             store,
-		portmappers:       pms,
-		bridgeConfig:      config,
-		networks:          map[string]*network{},
-		parents:           map[string]*parentRuntime{},
-		datapathEndpoints: map[string]struct{}{},
+		store:               store,
+		portmappers:         pms,
+		bridgeConfig:        config,
+		networks:            map[string]*network{},
+		parents:             map[string]*parentRuntime{},
+		datapathEndpoints:   map[string]struct{}{},
+		sharedDatapathLinks: map[string]struct{}{},
 	}
 	d.probe = d.probeNetkitSupport
 
