@@ -11,6 +11,7 @@ import (
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/host"
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/ipvlan"
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/macvlan"
+	"github.com/moby/moby/v2/daemon/libnetwork/drivers/netkit"
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/null"
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/overlay"
 	"github.com/moby/moby/v2/daemon/libnetwork/drvregistry"
@@ -33,6 +34,7 @@ func registerNetworkDrivers(r driverapi.Registerer, cfg *config.Config, store *d
 		{ntype: host.NetworkType, register: func() error { return host.Register(r) }},
 		{ntype: ipvlan.NetworkType, register: func() error { return ipvlan.Register(r, store) }},
 		{ntype: macvlan.NetworkType, register: func() error { return macvlan.Register(r, store) }},
+		{ntype: netkit.NetworkType, register: func() error { return netkit.Register(r, store, pms, cfg.BridgeConfig) }},
 		{ntype: null.NetworkType, register: func() error { return null.Register(r) }},
 		{ntype: overlay.NetworkType, register: func() error { return overlay.Register(r) }},
 	} {
