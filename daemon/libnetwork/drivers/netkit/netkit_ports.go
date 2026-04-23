@@ -564,6 +564,13 @@ func (r *bridgePublishedPortRuntime) mapPortBindingReqs(ctx context.Context, req
 	}
 
 	var all []portmapperapi.PortBinding
+	rollbackMapped := func(cause error) error {
+		if len(all) == 0 {
+			return cause
+		}
+		return errors.Join(cause, r.unmapPortBindings(ctx, all))
+	}
+
 	var batch []portmapperapi.PortBindingReq
 	for i, req := range reqs {
 		batch = append(batch, req)
@@ -573,15 +580,14 @@ func (r *bridgePublishedPortRuntime) mapPortBindingReqs(ctx context.Context, req
 
 		pm, err := r.portmappers.Get(batch[0].Mapper)
 		if err != nil {
-			return nil, err
+			return nil, rollbackMapped(err)
 		}
 		mapped, err := pm.MapPorts(ctx, batch)
 		if err != nil {
-			return nil, err
+			return nil, rollbackMapped(err)
 		}
 		if err := validateNetkitMappedBindings(mapped); err != nil {
-			_ = pm.UnmapPorts(ctx, mapped)
-			return nil, err
+			return nil, rollbackMapped(errors.Join(err, pm.UnmapPorts(ctx, mapped)))
 		}
 		for i := range mapped {
 			mapped[i].Mapper = batch[0].Mapper
@@ -594,8 +600,10 @@ func (r *bridgePublishedPortRuntime) mapPortBindingReqs(ctx context.Context, req
 
 func validateNetkitMappedBindings(bindings []portmapperapi.PortBinding) error {
 	for _, binding := range bindings {
-		if binding.RootlesskitUnsupported || binding.PortDriverRemove != nil || (len(binding.ChildHostIP) > 0 && !binding.ChildHostIP.Equal(binding.HostIP)) {
-			return types.InvalidParameterErrorf("netkit pure eBPF port mapping does not support rootless port drivers")
+		childHostIPMismatch := len(binding.ChildHostIP) > 0 && !binding.ChildHostIP.Equal(binding.HostIP)
+		if binding.RootlesskitUnsupported || binding.PortDriverRemove != nil || childHostIPMismatch {
+			return types.InvalidParameterErrorf("netkit pure eBPF port mapping does not support rootless port drivers: binding=%s rootlesskit_unsupported=%t port_driver_remove=%t host_ip=%s child_host_ip=%s",
+				binding, binding.RootlesskitUnsupported, binding.PortDriverRemove != nil, binding.HostIP, binding.ChildHostIP)
 		}
 	}
 	return nil

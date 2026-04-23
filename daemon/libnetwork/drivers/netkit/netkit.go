@@ -11,6 +11,7 @@ import (
 	"github.com/moby/moby/v2/daemon/libnetwork/driverapi"
 	"github.com/moby/moby/v2/daemon/libnetwork/drivers/bridge"
 	"github.com/moby/moby/v2/daemon/libnetwork/drvregistry"
+	"github.com/moby/moby/v2/daemon/libnetwork/netlabel"
 	"github.com/moby/moby/v2/daemon/libnetwork/portmapperapi"
 	"github.com/moby/moby/v2/daemon/libnetwork/scope"
 	"github.com/moby/moby/v2/daemon/libnetwork/types"
@@ -122,7 +123,30 @@ func Register(r driverapi.Registerer, store *datastore.Store, pms *drvregistry.P
 }
 
 func (d *driver) EndpointOperInfo(nid, eid string) (map[string]any, error) {
-	return map[string]any{}, nil
+	n, err := d.getNetwork(nid)
+	if err != nil {
+		return nil, err
+	}
+	ep, err := n.endpoint(eid)
+	if err != nil {
+		return nil, err
+	}
+
+	m := make(map[string]any)
+	if ep.extConnConfig != nil && ep.extConnConfig.ExposedPorts != nil {
+		m[netlabel.ExposedPorts] = append([]types.TransportPort(nil), ep.extConnConfig.ExposedPorts...)
+	}
+	if ep.portMapping != nil {
+		pmc := make([]types.PortBinding, 0, len(ep.portMapping))
+		for _, pm := range ep.portMapping {
+			pmc = append(pmc, pm.PortBinding.Copy())
+		}
+		m[netlabel.PortMap] = pmc
+	}
+	if len(ep.mac) != 0 {
+		m[netlabel.MacAddress] = append(net.HardwareAddr(nil), ep.mac...)
+	}
+	return m, nil
 }
 
 func (d *driver) Type() string {

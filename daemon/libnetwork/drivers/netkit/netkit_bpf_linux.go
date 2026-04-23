@@ -573,16 +573,15 @@ func (d *ebpfPublishedPortDatapath) RemoveBindings(bindings []portmapperapi.Port
 			if err := d.handles.PublishedPortsV4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				errs = append(errs, fmt.Errorf("delete published-port ipv4 map entry for %s: %w", binding, err))
 			}
-			continue
-		}
-
-		key, err := publishedPortKeyV6FromBinding(binding)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if err := d.handles.PublishedPortsV6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			errs = append(errs, fmt.Errorf("delete published-port ipv6 map entry for %s: %w", binding, err))
+		} else {
+			key, err := publishedPortKeyV6FromBinding(binding)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if err := d.handles.PublishedPortsV6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				errs = append(errs, fmt.Errorf("delete published-port ipv6 map entry for %s: %w", binding, err))
+			}
 		}
 
 		errs = append(errs, d.removeBindingState(binding)...)

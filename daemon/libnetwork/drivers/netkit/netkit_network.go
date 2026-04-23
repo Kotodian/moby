@@ -194,13 +194,13 @@ func parseNetworkGenericOptions(data any) (*configuration, error) {
 	case *configuration:
 		return opt, nil
 	case map[string]string:
-		return newConfigFromLabels(opt), nil
+		return newConfigFromLabels(opt)
 	default:
 		return nil, types.InvalidParameterErrorf("unrecognized network configuration format: %v", opt)
 	}
 }
 
-func newConfigFromLabels(labels map[string]string) *configuration {
+func newConfigFromLabels(labels map[string]string) (*configuration, error) {
 	config := defaultConfiguration()
 	for label, value := range labels {
 		if label == parentOpt {
@@ -208,10 +208,10 @@ func newConfigFromLabels(labels map[string]string) *configuration {
 			continue
 		}
 		if err := config.applyBridgeLabel(label, value); err != nil {
-			continue
+			return nil, err
 		}
 	}
-	return config
+	return config, nil
 }
 
 func (config *configuration) processIPAM(ipamV4Data, ipamV6Data []driverapi.IPAMData) {

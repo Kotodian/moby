@@ -28,12 +28,10 @@ func TestDockerNetworkNetkit(t *testing.T) {
 
 	ctx := setupTest(t)
 	apiClient := testEnv.APIClient()
-	skip.If(t, !linkExists(ctx, t, parentBridge), "docker0 bridge is not available")
 
 	netName := "nk-test"
 	net.CreateNoError(ctx, t, apiClient, netName,
 		net.WithDriver("netkit"),
-		net.WithOption("parent", parentBridge),
 		net.WithIPAM("172.29.0.0/24", "172.29.0.1"),
 	)
 	defer net.RemoveNoError(ctx, t, apiClient, netName)

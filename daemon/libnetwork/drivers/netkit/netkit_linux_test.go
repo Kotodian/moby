@@ -83,7 +83,7 @@ func TestParseNetworkOptionsAcceptsL3NativeDefaults(t *testing.T) {
 }
 
 func TestNewConfigFromLabelsParsesNATLabels(t *testing.T) {
-	cfg := newConfigFromLabels(map[string]string{
+	cfg, err := newConfigFromLabels(map[string]string{
 		bridge.EnableIPMasquerade: "false",
 		bridge.IPv4GatewayMode:    "routed",
 		bridge.IPv6GatewayMode:    "nat",
@@ -91,11 +91,85 @@ func TestNewConfigFromLabelsParsesNATLabels(t *testing.T) {
 		netlabel.HostIPv6:         "2001:db8::10",
 	})
 
+	assert.NilError(t, err)
 	assert.Check(t, !cfg.EnableIPMasquerade)
 	assert.Check(t, is.Equal(cfg.GwModeIPv4, gwModeRouted))
 	assert.Check(t, is.Equal(cfg.GwModeIPv6, gwModeNAT))
 	assert.Check(t, cfg.HostIPv4.Equal(net.ParseIP("192.0.2.10")))
 	assert.Check(t, cfg.HostIPv6.Equal(net.ParseIP("2001:db8::10")))
+}
+
+func TestParseNetworkOptionsRejectsInvalidBridgeLabelValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		label string
+		value string
+	}{
+		{
+			name:  "invalid ipv4 gateway mode",
+			label: bridge.IPv4GatewayMode,
+			value: "bogus",
+		},
+		{
+			name:  "invalid host ipv4",
+			label: netlabel.HostIPv4,
+			value: "2001:db8::10",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseNetworkOptions("network-id", map[string]any{
+				netlabel.GenericData: map[string]string{
+					tc.label: tc.value,
+				},
+			})
+			assert.Check(t, err != nil)
+			assert.Check(t, is.ErrorContains(err, "invalid"))
+		})
+	}
+}
+
+func TestEndpointOperInfoReturnsPublishedPorts(t *testing.T) {
+	d := &driver{
+		networks: map[string]*network{
+			"n1": {
+				id: "n1",
+				endpoints: map[string]*endpoint{
+					"ep1": {
+						id: "ep1",
+						extConnConfig: &connectivityConfiguration{
+							ExposedPorts: []types.TransportPort{{Proto: types.TCP, Port: 80}},
+						},
+						portMapping: []portmapperapi.PortBinding{{
+							PortBinding: types.PortBinding{
+								Proto:    types.TCP,
+								IP:       net.ParseIP("172.30.0.11"),
+								Port:     80,
+								HostIP:   net.IPv4zero,
+								HostPort: 8080,
+							},
+							Mapper: "nat",
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	data, err := d.EndpointOperInfo("n1", "ep1")
+	assert.NilError(t, err)
+
+	pmd, ok := data[netlabel.PortMap]
+	assert.Assert(t, ok)
+	pbs, ok := pmd.([]types.PortBinding)
+	assert.Assert(t, ok)
+	assert.Assert(t, is.Len(pbs, 1))
+	assert.Check(t, pbs[0].IP.Equal(net.ParseIP("172.30.0.11")))
+	assert.Check(t, pbs[0].HostIP.Equal(net.IPv4zero))
+	assert.Check(t, is.Equal(pbs[0].HostPort, uint16(8080)))
+
+	exposed, ok := data[netlabel.ExposedPorts].([]types.TransportPort)
+	assert.Assert(t, ok)
+	assert.DeepEqual(t, exposed, []types.TransportPort{{Proto: types.TCP, Port: 80}})
 }
 
 func TestProbeKernelReturnsNotImplemented(t *testing.T) {
@@ -1379,6 +1453,44 @@ func TestBridgePublishedPortRuntimeRejectsRootlessPortDrivers(t *testing.T) {
 	assert.Check(t, is.ErrorContains(err, "rootless"))
 }
 
+func TestBridgePublishedPortRuntimeRollsBackMappedBatchesOnMapFailure(t *testing.T) {
+	pms := &drvregistry.PortMappers{}
+	natPM := &stubPortMapper{failOnCall: 2}
+	assert.NilError(t, pms.Register("nat", natPM))
+
+	rt := &bridgePublishedPortRuntime{portmappers: pms}
+	_, err := rt.mapPortBindingReqs(context.Background(), []portmapperapi.PortBindingReq{
+		{
+			PortBinding: types.PortBinding{
+				Proto:       types.TCP,
+				IP:          net.ParseIP("172.30.0.11"),
+				Port:        80,
+				HostIP:      net.IPv4zero,
+				HostPort:    8080,
+				HostPortEnd: 8080,
+			},
+			Mapper: "nat",
+		},
+		{
+			PortBinding: types.PortBinding{
+				Proto:       types.TCP,
+				IP:          net.ParseIP("172.30.0.11"),
+				Port:        81,
+				HostIP:      net.IPv4zero,
+				HostPort:    8081,
+				HostPortEnd: 8081,
+			},
+			Mapper: "nat",
+		},
+	})
+
+	assert.Check(t, err != nil)
+	assert.Check(t, is.ErrorContains(err, "stubPortMapper.MapPorts"))
+	assert.Check(t, is.Len(natPM.mapped, 0))
+	assert.Assert(t, is.Len(natPM.unmapped, 1))
+	assert.Check(t, is.Equal(natPM.unmapped[0][0].HostPort, uint16(8080)))
+}
+
 func TestBridgePublishedPortRuntimeReleaseRemovesDatapathBindings(t *testing.T) {
 	datapath := &fakePublishedPortDatapath{}
 	newPublishedPortDatapathSaved := newPublishedPortDatapath
@@ -1572,13 +1684,18 @@ func mustParseCIDR(t *testing.T, cidr string) *net.IPNet {
 }
 
 type stubPortMapper struct {
-	reqs   [][]portmapperapi.PortBindingReq
-	mapped []portmapperapi.PortBinding
+	reqs       [][]portmapperapi.PortBindingReq
+	mapped     []portmapperapi.PortBinding
+	unmapped   [][]portmapperapi.PortBinding
+	failOnCall int
 }
 
 func (pm *stubPortMapper) MapPorts(_ context.Context, reqs []portmapperapi.PortBindingReq) ([]portmapperapi.PortBinding, error) {
 	if len(reqs) == 0 {
 		return []portmapperapi.PortBinding{}, nil
+	}
+	if pm.failOnCall != 0 && len(pm.reqs)+1 == pm.failOnCall {
+		return nil, fmt.Errorf("stubPortMapper.MapPorts failure on call %d", pm.failOnCall)
 	}
 	pm.reqs = append(pm.reqs, sliceutil.Map(reqs, func(req portmapperapi.PortBindingReq) portmapperapi.PortBindingReq {
 		return portmapperapi.PortBindingReq{PortBinding: req.Copy(), Mapper: req.Mapper}
@@ -1591,6 +1708,7 @@ func (pm *stubPortMapper) MapPorts(_ context.Context, reqs []portmapperapi.PortB
 }
 
 func (pm *stubPortMapper) UnmapPorts(_ context.Context, reqs []portmapperapi.PortBinding) error {
+	pm.unmapped = append(pm.unmapped, slices.Clone(reqs))
 	for _, req := range reqs {
 		idx := slices.IndexFunc(pm.mapped, func(pb portmapperapi.PortBinding) bool {
 			return pb.Equal(req.PortBinding) && pb.Mapper == req.Mapper

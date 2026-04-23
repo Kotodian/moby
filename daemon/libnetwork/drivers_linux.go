@@ -47,16 +47,16 @@ func registerNetworkDrivers(r driverapi.Registerer, cfg *config.Config, store *d
 }
 
 func registerPortMappers(ctx context.Context, r *drvregistry.PortMappers, cfg *config.Config) error {
-	var pdc *rlkclient.PortDriverClient
+	var natCfg nat.Config
 	if cfg.Rootless {
 		var err error
-		pdc, err = rlkclient.NewPortDriverClient(ctx)
+		natCfg.RlkClient, err = rlkclient.NewPortDriverClient(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create port driver client: %w", err)
 		}
 	}
 
-	if err := nat.Register(r, nat.Config{RlkClient: pdc}); err != nil {
+	if err := nat.Register(r, natCfg); err != nil {
 		return fmt.Errorf("registering nat portmapper: %w", err)
 	}
 
