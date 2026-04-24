@@ -76,7 +76,7 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 	if err != nil {
 		return fmt.Errorf("error generating a container interface name: %w", err)
 	}
-	if err := createNetkitFn(hostIfName, containerIfName, n.config.Parent, sboxKey, ep.mac); err != nil {
+	if err := createNetkitFn(hostIfName, containerIfName, n.config.Parent, sboxKey, ep.mac, n.config.EnableBigTCP); err != nil {
 		return err
 	}
 	defer cleanupFailedJoin(hostIfName, &retErr)

@@ -3,9 +3,13 @@
 package netkit
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/daemon/libnetwork/nlwrap"
 	"github.com/moby/moby/v2/daemon/libnetwork/ns"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -13,7 +17,16 @@ import (
 
 var createNetkitFn = createNetkit
 
-func createNetkit(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+const netkitBigTCPMaxSize = 196608
+
+type bigTCPConfigurer interface {
+	LinkSetGSOMaxSize(netlink.Link, int) error
+	LinkSetGROMaxSize(netlink.Link, int) error
+	LinkSetGSOIPv4MaxSize(netlink.Link, int) error
+	LinkSetGROIPv4MaxSize(netlink.Link, int) error
+}
+
+func createNetkit(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 	_ = parent
 	_ = mac
 
@@ -56,5 +69,40 @@ func createNetkit(hostIfName, containerIfName, parent, sboxKey string, mac net.H
 		_ = ns.NlHandle().LinkDel(hostLink)
 		return fmt.Errorf("failed to bring up netkit primary %s: %w", hostIfName, err)
 	}
+	if enableBigTCP {
+		if err := configureNetkitBigTCP(hostLink, netnsh, containerIfName); err != nil {
+			log.G(context.TODO()).Debugf("failed to enable BIG TCP max sizes on netkit pair %s/%s: %v", hostIfName, containerIfName, err)
+		}
+	}
 	return nil
+}
+
+func configureNetkitBigTCP(hostLink netlink.Link, peerNetns netns.NsHandle, peerName string) error {
+	errs := []error{
+		setLinkBigTCPMaxSizes(ns.NlHandle(), hostLink),
+	}
+
+	peerHandle, err := nlwrap.NewHandleAt(peerNetns)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("open peer netns handle: %w", err))
+		return errors.Join(errs...)
+	}
+	defer peerHandle.Close()
+
+	peerLink, err := peerHandle.LinkByName(peerName)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("find peer link %s: %w", peerName, err))
+		return errors.Join(errs...)
+	}
+	errs = append(errs, setLinkBigTCPMaxSizes(peerHandle, peerLink))
+	return errors.Join(errs...)
+}
+
+func setLinkBigTCPMaxSizes(h bigTCPConfigurer, link netlink.Link) error {
+	return errors.Join(
+		h.LinkSetGROMaxSize(link, netkitBigTCPMaxSize),
+		h.LinkSetGSOMaxSize(link, netkitBigTCPMaxSize),
+		h.LinkSetGROIPv4MaxSize(link, netkitBigTCPMaxSize),
+		h.LinkSetGSOIPv4MaxSize(link, netkitBigTCPMaxSize),
+	)
 }

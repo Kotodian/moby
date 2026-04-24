@@ -30,6 +30,7 @@ type configuration struct {
 	Internal           bool
 	Parent             string
 	EnableIPMasquerade bool
+	EnableBigTCP       bool
 	GwModeIPv4         gwMode
 	GwModeIPv6         gwMode
 	HostIPv4           net.IP
@@ -234,6 +235,7 @@ func (config *configuration) MarshalJSON() ([]byte, error) {
 		"Parent":             config.Parent,
 		"Internal":           config.Internal,
 		"EnableIPMasquerade": config.EnableIPMasquerade,
+		"EnableBigTCP":       config.EnableBigTCP,
 		"GwModeIPv4":         config.GwModeIPv4,
 		"GwModeIPv6":         config.GwModeIPv6,
 		"HostIPv4":           config.HostIPv4.String(),
@@ -262,6 +264,7 @@ func (config *configuration) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	config.EnableBigTCP = true
 	config.ID = nMap["ID"].(string)
 	if v, ok := nMap["Parent"]; ok {
 		config.Parent, _ = v.(string)
@@ -269,6 +272,9 @@ func (config *configuration) UnmarshalJSON(b []byte) error {
 	config.Internal = nMap["Internal"].(bool)
 	if v, ok := nMap["EnableIPMasquerade"]; ok {
 		config.EnableIPMasquerade = v.(bool)
+	}
+	if v, ok := nMap["EnableBigTCP"]; ok {
+		config.EnableBigTCP = v.(bool)
 	}
 	if v, ok := nMap["GwModeIPv4"]; ok {
 		config.GwModeIPv4, _ = newGwMode(v.(string))
@@ -299,6 +305,7 @@ func (config *configuration) UnmarshalJSON(b []byte) error {
 func defaultConfiguration() *configuration {
 	return &configuration{
 		EnableIPMasquerade: true,
+		EnableBigTCP:       true,
 		GwModeIPv4:         gwModeNAT,
 		GwModeIPv6:         gwModeNAT,
 	}
@@ -314,6 +321,15 @@ func (c *configuration) applyBridgeLabel(label, value string) error {
 			c.EnableIPMasquerade = false
 		default:
 			return types.InvalidParameterErrorf("invalid value for %s: %s", bridge.EnableIPMasquerade, value)
+		}
+	case bigTCPOpt:
+		switch value {
+		case "true":
+			c.EnableBigTCP = true
+		case "false":
+			c.EnableBigTCP = false
+		default:
+			return types.InvalidParameterErrorf("invalid value for %s: %s", bigTCPOpt, value)
 		}
 	case bridge.IPv4GatewayMode:
 		mode, err := newGwMode(value)

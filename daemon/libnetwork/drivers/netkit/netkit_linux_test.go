@@ -532,7 +532,7 @@ func TestJoinUsesConnectedDefaultRoutes(t *testing.T) {
 	generateIfaceNameSaved := generateIfaceName
 	hostLinkByNameSaved := hostLinkByName
 	replaceHostRouteSaved := replaceHostRoute
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		assert.Check(t, is.Equal(parent, ""))
 		assert.Check(t, mac == nil)
 		return nil
@@ -620,6 +620,73 @@ func TestCreateEndpointRejectsCustomMACInL3Mode(t *testing.T) {
 	assert.Check(t, is.ErrorContains(err, "support custom mac"))
 }
 
+func TestNetkitBigTCPDefaultsEnabled(t *testing.T) {
+	config := defaultConfiguration()
+
+	assert.Check(t, config.EnableBigTCP)
+}
+
+func TestNetkitBigTCPLabelParsesBool(t *testing.T) {
+	config, err := newConfigFromLabels(map[string]string{
+		bigTCPOpt: "false",
+	})
+	assert.NilError(t, err)
+	assert.Check(t, !config.EnableBigTCP)
+
+	config, err = newConfigFromLabels(map[string]string{
+		bigTCPOpt: "true",
+	})
+	assert.NilError(t, err)
+	assert.Check(t, config.EnableBigTCP)
+}
+
+func TestNetkitBigTCPLabelRejectsInvalidValue(t *testing.T) {
+	_, err := newConfigFromLabels(map[string]string{
+		bigTCPOpt: "bogus",
+	})
+
+	assert.Check(t, err != nil)
+	assert.Check(t, is.ErrorContains(err, bigTCPOpt))
+}
+
+type fakeBigTCPConfigurer struct {
+	calls []string
+}
+
+func (f *fakeBigTCPConfigurer) LinkSetGSOMaxSize(link netlink.Link, maxSize int) error {
+	f.calls = append(f.calls, fmt.Sprintf("gso:%s:%d", link.Attrs().Name, maxSize))
+	return nil
+}
+
+func (f *fakeBigTCPConfigurer) LinkSetGROMaxSize(link netlink.Link, maxSize int) error {
+	f.calls = append(f.calls, fmt.Sprintf("gro:%s:%d", link.Attrs().Name, maxSize))
+	return nil
+}
+
+func (f *fakeBigTCPConfigurer) LinkSetGSOIPv4MaxSize(link netlink.Link, maxSize int) error {
+	f.calls = append(f.calls, fmt.Sprintf("gso4:%s:%d", link.Attrs().Name, maxSize))
+	return nil
+}
+
+func (f *fakeBigTCPConfigurer) LinkSetGROIPv4MaxSize(link netlink.Link, maxSize int) error {
+	f.calls = append(f.calls, fmt.Sprintf("gro4:%s:%d", link.Attrs().Name, maxSize))
+	return nil
+}
+
+func TestSetLinkBigTCPMaxSizesConfiguresIPv4AndIPv6(t *testing.T) {
+	fake := &fakeBigTCPConfigurer{}
+	link := &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{Name: "nk123", Index: 42}}
+
+	assert.NilError(t, setLinkBigTCPMaxSizes(fake, link))
+
+	assert.DeepEqual(t, fake.calls, []string{
+		"gro:nk123:196608",
+		"gso:nk123:196608",
+		"gro4:nk123:196608",
+		"gso4:nk123:196608",
+	})
+}
+
 func TestJoinProgramsHostRoutesForEndpoint(t *testing.T) {
 	store := storeutils.NewTempStore(t)
 	epDatapath := &fakeEndpointNetkitDatapath{}
@@ -634,7 +701,7 @@ func TestJoinProgramsHostRoutesForEndpoint(t *testing.T) {
 	nw := &network{
 		id:        "dummy",
 		driver:    d,
-		config:    &configuration{ID: "dummy"},
+		config:    &configuration{ID: "dummy", EnableBigTCP: true},
 		endpoints: map[string]*endpoint{},
 	}
 	d.networks[nw.id] = nw
@@ -644,7 +711,8 @@ func TestJoinProgramsHostRoutesForEndpoint(t *testing.T) {
 	hostLinkByNameSaved := hostLinkByName
 	replaceHostRouteSaved := replaceHostRoute
 	var replaced []netlink.Route
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
+		assert.Check(t, enableBigTCP)
 		return nil
 	}
 	ifaceNames := []string{"nkhost0", "nkcont0"}
@@ -712,7 +780,7 @@ func TestJoinProgramsEgressMasqueradeState(t *testing.T) {
 	hostLinkByNameSaved := hostLinkByName
 	replaceHostRouteSaved := replaceHostRoute
 	newPublishedPortDatapathSaved := newPublishedPortDatapath
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		return nil
 	}
 	ifaceNames := []string{"nkhost0", "nkcont0"}
@@ -804,7 +872,7 @@ func TestLeaveRemovesEgressMasqueradeState(t *testing.T) {
 	replaceHostRouteSaved := replaceHostRoute
 	deleteHostRouteSaved := deleteHostRoute
 	newPublishedPortDatapathSaved := newPublishedPortDatapath
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		return nil
 	}
 	ifaceNames := []string{"nkhost0", "nkcont0"}
@@ -898,7 +966,7 @@ func TestJoinAndProgramExternalConnectivityPublishesPorts(t *testing.T) {
 	hostLinkByNameSaved := hostLinkByName
 	replaceHostRouteSaved := replaceHostRoute
 	deleteHostRouteSaved := deleteHostRoute
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		return nil
 	}
 	ifaceNames := []string{"nkhost0", "nkcont0"}
@@ -987,7 +1055,7 @@ func TestJoinRejectsCrossFamilyPublishedPortBinding(t *testing.T) {
 
 	createNetkitSaved := createNetkitFn
 	generateIfaceNameSaved := generateIfaceName
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		return nil
 	}
 	ifaceNames := []string{"nkhostx", "nkcontx"}
@@ -1054,7 +1122,7 @@ func TestPublishedPortRuntimeIsScopedPerNetwork(t *testing.T) {
 	hostLinkByNameSaved := hostLinkByName
 	replaceHostRouteSaved := replaceHostRoute
 	deleteHostRouteSaved := deleteHostRoute
-	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr) error {
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
 		return nil
 	}
 	ifaceIdx := 0
@@ -1928,6 +1996,24 @@ func TestBPFIPv4ParserOnlyAcceptsICMPAmongUnsupportedL4(t *testing.T) {
 		"\n" +
 		"\t\treturn -1;"
 	assert.Check(t, strings.Contains(src, expected), "IPv4 parser must only accept ICMP after TCP/UDP; other protocols must remain unsupported")
+}
+
+func TestBPFIPv6ParserHandlesBigTCPJumboHopByHopHeader(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	for _, expected := range []string{
+		"static __always_inline int parse_ipv6_l4(struct __sk_buff *skb, struct packet_info *pkt,",
+		"struct hop_jumbo_hdr *hop = data + pkt->l4_off;",
+		"if (ip6h->payload_len == 0 && ip6h->nexthdr == NEXTHDR_HOP) {",
+		"if (hop->tlv_type != IPV6_TLV_JUMBO || hop->tlv_len != sizeof(hop->jumbo_payload_len))",
+		"pkt->proto = hop->nexthdr;",
+		"pkt->l3_len = bpf_ntohl(hop->jumbo_payload_len) + sizeof(*ip6h);",
+		"pkt->l4_off += sizeof(*hop);",
+	} {
+		assert.Check(t, strings.Contains(src, expected), "IPv6 parser must handle BIG TCP Hop-by-Hop jumbo option: missing %q", expected)
+	}
 }
 
 func TestClassifyPublishedPortDatapathErrorUnsupportedIsNotImplemented(t *testing.T) {

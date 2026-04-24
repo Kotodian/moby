@@ -17,6 +17,8 @@
 #define ETH_P_8021AD 0x88A8
 #define IP_MF 0x2000
 #define IP_OFFSET 0x1fff
+#define NEXTHDR_HOP 0
+#define IPV6_TLV_JUMBO 194
 #define IPPROTO_ICMPV6 58
 #define ICMP_ECHOREPLY 0
 #define ICMP_ECHO 8
@@ -356,6 +358,64 @@ static __always_inline int parse_l3(void *data, void *data_end, __be16 skb_proto
 	return 0;
 }
 
+static __always_inline int parse_ipv6_l4(struct __sk_buff *skb, struct packet_info *pkt,
+					 void *data, void *data_end, const struct ipv6hdr *ip6h)
+{
+	(void)skb;
+
+	if (ip6h->payload_len == 0 && ip6h->nexthdr == NEXTHDR_HOP) {
+		struct hop_jumbo_hdr *hop = data + pkt->l4_off;
+
+		if ((void *)(hop + 1) > data_end)
+			return -1;
+		if (hop->tlv_type != IPV6_TLV_JUMBO || hop->tlv_len != sizeof(hop->jumbo_payload_len))
+			return -1;
+		if (hop->hdrlen != 0 || hop->nexthdr != IPPROTO_TCP)
+			return -1;
+
+		pkt->proto = hop->nexthdr;
+		pkt->l3_len = bpf_ntohl(hop->jumbo_payload_len) + sizeof(*ip6h);
+		pkt->l4_off += sizeof(*hop);
+	}
+
+	if (pkt->proto == IPPROTO_TCP) {
+		struct tcphdr *tcph = data + pkt->l4_off;
+
+		if ((void *)(tcph + 1) > data_end)
+			return -1;
+		pkt->sport = tcph->source;
+		pkt->dport = tcph->dest;
+		pkt->l4_csum_off = pkt->l4_off + offsetof(struct tcphdr, check);
+		return 0;
+	}
+
+	if (pkt->proto == IPPROTO_UDP) {
+		struct udphdr *udph = data + pkt->l4_off;
+
+		if ((void *)(udph + 1) > data_end)
+			return -1;
+		pkt->sport = udph->source;
+		pkt->dport = udph->dest;
+		pkt->l4_csum_off = pkt->l4_off + offsetof(struct udphdr, check);
+		return 0;
+	}
+
+	if (pkt->proto == IPPROTO_ICMPV6) {
+		struct icmp6hdr *icmp6h = data + pkt->l4_off;
+
+		if ((void *)(icmp6h + 1) > data_end)
+			return -1;
+		pkt->l4_csum_off = pkt->l4_off + offsetof(struct icmp6hdr, icmp6_cksum);
+		if (icmp6h->icmp6_type == ICMPV6_ECHO_REQUEST ||
+		    icmp6h->icmp6_type == ICMPV6_ECHO_REPLY) {
+			pkt->sport = icmp6h->icmp6_dataun.u_echo.identifier;
+			pkt->dport = icmp6h->icmp6_dataun.u_echo.identifier;
+		}
+	}
+
+	return 0;
+}
+
 static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *pkt)
 {
 	void *data = (void *)(long)skb->data;
@@ -444,42 +504,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 		pkt->daddr6 = ip6h->daddr;
 		pkt->l4_off = pkt->l3_off + sizeof(*ip6h);
 
-		if (pkt->proto == IPPROTO_TCP) {
-			struct tcphdr *tcph = data + pkt->l4_off;
-
-			if ((void *)(tcph + 1) > data_end)
-				return -1;
-			pkt->sport = tcph->source;
-			pkt->dport = tcph->dest;
-			pkt->l4_csum_off = pkt->l4_off + offsetof(struct tcphdr, check);
-			return 0;
-		}
-
-		if (pkt->proto == IPPROTO_UDP) {
-			struct udphdr *udph = data + pkt->l4_off;
-
-			if ((void *)(udph + 1) > data_end)
-				return -1;
-			pkt->sport = udph->source;
-			pkt->dport = udph->dest;
-			pkt->l4_csum_off = pkt->l4_off + offsetof(struct udphdr, check);
-			return 0;
-		}
-
-		if (pkt->proto == IPPROTO_ICMPV6) {
-			struct icmp6hdr *icmp6h = data + pkt->l4_off;
-
-			if ((void *)(icmp6h + 1) > data_end)
-				return -1;
-			pkt->l4_csum_off = pkt->l4_off + offsetof(struct icmp6hdr, icmp6_cksum);
-			if (icmp6h->icmp6_type == ICMPV6_ECHO_REQUEST ||
-			    icmp6h->icmp6_type == ICMPV6_ECHO_REPLY) {
-				pkt->sport = icmp6h->icmp6_dataun.u_echo.identifier;
-				pkt->dport = icmp6h->icmp6_dataun.u_echo.identifier;
-			}
-		}
-
-		return 0;
+		return parse_ipv6_l4(skb, pkt, data, data_end, ip6h);
 	}
 
 	return -1;

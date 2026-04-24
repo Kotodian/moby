@@ -11,4 +11,5 @@ const (
 
 	NetworkType = "netkit"
 	parentOpt   = "parent"
+	bigTCPOpt   = "com.docker.network.netkit.big_tcp"
 )
