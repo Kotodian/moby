@@ -751,6 +751,67 @@ func TestJoinProgramsHostRoutesForEndpoint(t *testing.T) {
 	assert.Check(t, is.Equal(replaced[1].Scope, netlink.SCOPE_LINK))
 }
 
+func TestJoinProgramsLocalEndpointState(t *testing.T) {
+	store := storeutils.NewTempStore(t)
+	epDatapath := &fakeEndpointNetkitDatapath{}
+	d := &driver{
+		store:    store,
+		networks: map[string]*network{},
+		parents:  map[string]*parentRuntime{},
+		newEndpointDatapath: func(context.Context) (endpointNetkitDatapath, error) {
+			return epDatapath, nil
+		},
+	}
+	nw := &network{
+		id:        "dummy",
+		driver:    d,
+		config:    &configuration{ID: "dummy"},
+		endpoints: map[string]*endpoint{},
+	}
+	d.networks[nw.id] = nw
+
+	createNetkitSaved := createNetkitFn
+	generateIfaceNameSaved := generateIfaceName
+	hostLinkByNameSaved := hostLinkByName
+	replaceHostRouteSaved := replaceHostRoute
+	createNetkitFn = func(hostIfName, containerIfName, parent, sboxKey string, mac net.HardwareAddr, enableBigTCP bool) error {
+		return nil
+	}
+	ifaceNames := []string{"nkhost0", "nkcont0"}
+	generateIfaceName = func() (string, error) {
+		name := ifaceNames[0]
+		ifaceNames = ifaceNames[1:]
+		return name, nil
+	}
+	hostLinkByName = func(name string) (netlink.Link, error) {
+		assert.Check(t, is.Equal(name, "nkhost0"))
+		return &netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: name, Index: 42}}, nil
+	}
+	replaceHostRoute = func(*netlink.Route) error { return nil }
+	defer func() {
+		createNetkitFn = createNetkitSaved
+		generateIfaceName = generateIfaceNameSaved
+		hostLinkByName = hostLinkByNameSaved
+		replaceHostRoute = replaceHostRouteSaved
+	}()
+
+	te := newTestEndpoint(mustParseCIDR(t, "172.30.0.0/24"), 11)
+	_, ep6, err := net.ParseCIDR("fd00::11/64")
+	assert.NilError(t, err)
+	ep6.IP = net.ParseIP("fd00::11")
+	assert.NilError(t, te.Interface().SetIPAddress(ep6))
+	assert.NilError(t, d.CreateEndpoint(context.Background(), "dummy", "ep1", te.Interface(), nil))
+
+	assert.NilError(t, d.Join(context.Background(), "dummy", "ep1", "/netns/fake", te, nil, nil))
+	assert.Check(t, len(epDatapath.upsertedLocalEndpoints) > 0)
+	got := epDatapath.upsertedLocalEndpoints[len(epDatapath.upsertedLocalEndpoints)-1]
+	assert.Check(t, is.Equal(got.NetworkID, "dummy"))
+	assert.Check(t, got.NetworkKey != [16]byte{})
+	assert.Check(t, is.Equal(got.HostIf, "nkhost0"))
+	assert.Check(t, is.Equal(got.Addr.IP.String(), "172.30.0.11"))
+	assert.Check(t, is.Equal(got.Addrv6.IP.String(), "fd00::11"))
+}
+
 func TestJoinProgramsEgressMasqueradeState(t *testing.T) {
 	store := storeutils.NewTempStore(t)
 	epDatapath := &fakeEndpointNetkitDatapath{}
@@ -1210,6 +1271,9 @@ func TestLeaveRemovesHostRoutesWithoutPublishedPorts(t *testing.T) {
 	}
 
 	assert.NilError(t, d.Leave("dummy", "ep1"))
+	assert.Check(t, is.Len(epDatapath.removedLocalEndpoints, 1))
+	assert.Check(t, is.Equal(epDatapath.removedLocalEndpoints[0].HostIf, "nkhost0"))
+	assert.Check(t, is.Equal(epDatapath.removedLocalEndpoints[0].Addr.IP.String(), "172.31.0.11"))
 	assert.Check(t, is.Len(deleted, 1))
 	assert.Check(t, is.Equal(deleted[0].LinkIndex, 7))
 	assert.Check(t, is.DeepEqual(deleted[0].Dst, &net.IPNet{
@@ -1955,7 +2019,9 @@ func TestLoadNetkitPortmapIncludesPublishedPortMaps(t *testing.T) {
 	assert.Check(t, spec.Programs["portmap_ingress"] != nil)
 	assert.Check(t, spec.Programs["portmap_egress"] != nil)
 	assert.Check(t, spec.Programs["endpoint_primary"] != nil)
+	assert.Check(t, spec.Programs["endpoint_primary_pass"] != nil)
 	assert.Check(t, spec.Programs["endpoint_peer"] != nil)
+	assert.Check(t, spec.Programs["endpoint_peer_published"] != nil)
 	assert.Check(t, spec.Programs["connect4"] != nil)
 	assert.Check(t, spec.Programs["connect6"] != nil)
 	assert.Check(t, spec.Programs["sendmsg4"] != nil)
@@ -1967,6 +2033,9 @@ func TestLoadNetkitPortmapIncludesPublishedPortMaps(t *testing.T) {
 	assert.Check(t, spec.Maps["egress_flows_v4"] != nil)
 	assert.Check(t, spec.Maps["egress_flows_v6"] != nil)
 	assert.Check(t, spec.Maps["egress_ifaces"] != nil)
+	assert.Check(t, spec.Maps["local_sources"] != nil)
+	assert.Check(t, spec.Maps["local_endpoints_v4"] != nil)
+	assert.Check(t, spec.Maps["local_endpoints_v6"] != nil)
 	assert.Check(t, spec.Maps["published_ports_v4"] != nil)
 	assert.Check(t, spec.Maps["published_ports_v6"] != nil)
 	assert.Check(t, spec.Maps["published_flows_v4"] != nil)
@@ -2005,7 +2074,7 @@ func TestBPFIPv6ParserHandlesBigTCPJumboHopByHopHeader(t *testing.T) {
 	src := string(raw)
 	for _, expected := range []string{
 		"static __always_inline int parse_ipv6_l4(struct __sk_buff *skb, struct packet_info *pkt,",
-		"struct hop_jumbo_hdr *hop = data + pkt->l4_off;",
+		"struct netkit_hop_jumbo_hdr *hop = data + pkt->l4_off;",
 		"if (ip6h->payload_len == 0 && ip6h->nexthdr == NEXTHDR_HOP) {",
 		"if (hop->tlv_type != IPV6_TLV_JUMBO || hop->tlv_len != sizeof(hop->jumbo_payload_len))",
 		"pkt->proto = hop->nexthdr;",
@@ -2014,6 +2083,198 @@ func TestBPFIPv6ParserHandlesBigTCPJumboHopByHopHeader(t *testing.T) {
 	} {
 		assert.Check(t, strings.Contains(src, expected), "IPv6 parser must handle BIG TCP Hop-by-Hop jumbo option: missing %q", expected)
 	}
+}
+
+func TestBPFEndpointPeerChecksLocalEndpointBeforePublishedEgress(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	start := strings.Index(src, "int endpoint_peer(struct __sk_buff *skb)")
+	assert.Assert(t, start >= 0)
+	end := strings.Index(src[start:], `SEC("cgroup/connect4")`)
+	assert.Assert(t, end >= 0)
+	peer := src[start : start+end]
+
+	local := strings.Index(peer, "ret = redirect_local_endpoint(skb, &pkt);")
+	published := strings.Index(peer, "ret = process_published_egress(skb, &pkt);")
+	external := strings.Index(peer, "process_endpoint_external_egress(skb, &pkt)")
+	assert.Assert(t, local >= 0)
+	assert.Assert(t, published >= 0)
+	assert.Assert(t, external >= 0)
+	assert.Check(t, local < published, "local c2c redirect must avoid the published-flow miss on the endpoint peer fast path")
+	assert.Check(t, published < external, "published-port reply SNAT must still run before endpoint external egress/SNAT")
+}
+
+func TestBPFEndpointPeerPublishedChecksPublishedEgressBeforeLocalEndpoint(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	start := strings.Index(src, "int endpoint_peer_published(struct __sk_buff *skb)")
+	assert.Assert(t, start >= 0)
+	end := strings.Index(src[start:], `SEC("cgroup/connect4")`)
+	assert.Assert(t, end >= 0)
+	peer := src[start : start+end]
+
+	published := strings.Index(peer, "ret = process_published_egress(skb, &pkt);")
+	local := strings.Index(peer, "ret = redirect_local_endpoint(skb, &pkt);")
+	external := strings.Index(peer, "process_endpoint_external_egress(skb, &pkt)")
+	assert.Assert(t, published >= 0)
+	assert.Assert(t, local >= 0)
+	assert.Assert(t, external >= 0)
+	assert.Check(t, published < local, "published endpoints should avoid the local-endpoint miss on the published reply fast path")
+	assert.Check(t, local < external, "local c2c redirect must still run before endpoint external egress/SNAT")
+}
+
+func TestBPFHostFacingIngressUsesDNATOnlyPublishedPath(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	start := strings.Index(src, "static __always_inline int process_host_facing_ingress(")
+	assert.Assert(t, start >= 0)
+	end := strings.Index(src[start:], "static __always_inline int process_internal_ingress(")
+	assert.Assert(t, end >= 0)
+	hostFacing := src[start : start+end]
+	assert.Check(t, strings.Contains(hostFacing, "return process_published_dnat_ingress(skb, pkt);"))
+	assert.Check(t, !strings.Contains(hostFacing, "process_published_ingress(skb, pkt);"))
+
+	start = strings.Index(src, "static __always_inline int process_published_dnat_ingress(")
+	assert.Assert(t, start >= 0)
+	end = strings.Index(src[start:], "static __always_inline int process_published_ingress(")
+	assert.Assert(t, end >= 0)
+	dnatOnly := src[start : start+end]
+	assert.Check(t, !strings.Contains(dnatOnly, "lookup_flow_v4"))
+	assert.Check(t, !strings.Contains(dnatOnly, "lookup_flow_v6"))
+}
+
+func TestBPFPublishedPortLookupChecksWildcardFirstForNonLoopback(t *testing.T) {
+	raw, err := os.ReadFile("bpf/netkit_portmap.c")
+	assert.NilError(t, err)
+
+	src := string(raw)
+	for _, tc := range []struct {
+		fn       string
+		zero     string
+		loopback string
+		exact    string
+		wildcard string
+	}{
+		{
+			fn:       "lookup_published_port_v4",
+			zero:     "key.host_ip = 0;",
+			loopback: "if (loopback == 0) {",
+			exact:    "key.host_ip = bpf_ntohl(pkt->daddr4);",
+			wildcard: "key.host_ip = 0;",
+		},
+		{
+			fn:       "lookup_published_port_v6",
+			zero:     "__builtin_memset(key.host_ip, 0, sizeof(key.host_ip));",
+			loopback: "if (loopback == 0) {",
+			exact:    "__builtin_memcpy(key.host_ip, pkt->daddr6.in6_u.u6_addr8, sizeof(key.host_ip));",
+			wildcard: "__builtin_memset(key.host_ip, 0, sizeof(key.host_ip));",
+		},
+	} {
+		start := strings.Index(src, "static __always_inline int "+tc.fn+"(")
+		assert.Assert(t, start >= 0)
+		end := strings.Index(src[start:], "static __always_inline int lookup_sock_published_port")
+		if tc.fn == "lookup_published_port_v4" {
+			end = strings.Index(src[start:], "static __always_inline int lookup_published_port_v6(")
+		}
+		assert.Assert(t, end >= 0)
+		body := src[start : start+end]
+		nonLoopback := strings.Index(body, tc.loopback)
+		assert.Assert(t, nonLoopback >= 0)
+		fastPath := body[nonLoopback:]
+		wildcard := strings.Index(fastPath, tc.wildcard)
+		exact := strings.Index(fastPath, tc.exact)
+		assert.Assert(t, wildcard >= 0)
+		assert.Assert(t, exact >= 0)
+		assert.Check(t, wildcard < exact, "%s should avoid the exact-host miss first for default 0.0.0.0/:: published ports", tc.fn)
+	}
+}
+
+func TestAttachEndpointDatapathUsesPassPrimaryForUnpublishedEndpoint(t *testing.T) {
+	epDatapath := &fakeEndpointNetkitDatapath{}
+	d := &driver{
+		newEndpointDatapath: func(context.Context) (endpointNetkitDatapath, error) {
+			return epDatapath, nil
+		},
+	}
+	ep := &endpoint{
+		id:     "ep1",
+		nid:    "dummy",
+		hostIf: "nkhost0",
+	}
+
+	assert.NilError(t, d.attachEndpointDatapath(context.Background(), ep))
+	assert.DeepEqual(t, epDatapath.attached, []string{"nkhost0"})
+	assert.DeepEqual(t, epDatapath.attachedPublishedPorts, []bool{false})
+}
+
+func TestAttachEndpointDatapathUsesFullPrimaryForPublishedEndpoint(t *testing.T) {
+	epDatapath := &fakeEndpointNetkitDatapath{}
+	d := &driver{
+		newEndpointDatapath: func(context.Context) (endpointNetkitDatapath, error) {
+			return epDatapath, nil
+		},
+	}
+	ep := &endpoint{
+		id:              "ep1",
+		nid:             "dummy",
+		hostIf:          "nkhost0",
+		publishedParent: "dummy",
+	}
+
+	assert.NilError(t, d.attachEndpointDatapath(context.Background(), ep))
+	assert.DeepEqual(t, epDatapath.attached, []string{"nkhost0"})
+	assert.DeepEqual(t, epDatapath.attachedPublishedPorts, []bool{true})
+}
+
+func TestProgramExternalConnectivityUpgradesSharedEndpointToFullPrimary(t *testing.T) {
+	runtime := &fakePublishedPortRuntime{}
+	datapath := &fakePublishedPortDatapath{}
+	d := &driver{
+		networks:            map[string]*network{},
+		parents:             map[string]*parentRuntime{},
+		datapath:            datapath,
+		datapathEndpoints:   map[string]struct{}{"dummy/ep1": {}},
+		sharedDatapathLinks: map[string]struct{}{"dummy/ep1": {}},
+		newEndpointDatapath: func(context.Context) (endpointNetkitDatapath, error) {
+			return nil, errors.New("unexpected standalone datapath")
+		},
+		newPortRuntime: func(context.Context, string) (publishedPortRuntime, error) { return runtime, nil },
+	}
+	nw := &network{
+		id:     "dummy",
+		driver: d,
+		config: &configuration{
+			ID: "dummy",
+		},
+		endpoints: map[string]*endpoint{
+			"ep1": {
+				id:     "ep1",
+				nid:    "dummy",
+				hostIf: "nkhost0",
+				addr:   mustParseCIDR(t, "172.30.0.11/24"),
+				extConnConfig: &connectivityConfiguration{
+					PortBindings: []portmapperapi.PortBindingReq{{
+						PortBinding: types.PortBinding{
+							Proto:    types.TCP,
+							Port:     80,
+							HostPort: 8080,
+						},
+					}},
+				},
+			},
+		},
+	}
+	d.networks[nw.id] = nw
+
+	assert.NilError(t, d.ProgramExternalConnectivity(context.Background(), "dummy", "ep1", "ep1", ""))
+	assert.DeepEqual(t, datapath.attached, []string{"nkhost0"})
+	assert.DeepEqual(t, datapath.attachedPublishedPorts, []bool{true})
 }
 
 func TestClassifyPublishedPortDatapathErrorUnsupportedIsNotImplemented(t *testing.T) {
@@ -2098,18 +2359,22 @@ type fakePublishedPortDatapath struct {
 	added                     [][]portmapperapi.PortBinding
 	removed                   [][]portmapperapi.PortBinding
 	attached                  []string
+	attachedPublishedPorts    []bool
 	detached                  []string
 	addedParents              []string
 	removedParents            []string
 	upsertedEndpoints         []egressEndpointConfig
 	removedEndpoints          []egressEndpointConfig
+	upsertedLocalEndpoints    []localEndpointConfig
+	removedLocalEndpoints     []localEndpointConfig
 	addedPublishedEndpoints   []publishedEndpointConfig
 	removedPublishedEndpoints []publishedEndpointConfig
 	closeCalls                int
 }
 
-func (f *fakePublishedPortDatapath) AttachEndpoint(hostIf string) error {
+func (f *fakePublishedPortDatapath) AttachEndpoint(hostIf string, options endpointDatapathAttachOptions) error {
 	f.attached = append(f.attached, hostIf)
+	f.attachedPublishedPorts = append(f.attachedPublishedPorts, options.PublishedPorts)
 	return nil
 }
 
@@ -2135,6 +2400,16 @@ func (f *fakePublishedPortDatapath) UpsertEgressEndpoint(ep egressEndpointConfig
 
 func (f *fakePublishedPortDatapath) RemoveEgressEndpoint(ep egressEndpointConfig) error {
 	f.removedEndpoints = append(f.removedEndpoints, ep)
+	return nil
+}
+
+func (f *fakePublishedPortDatapath) UpsertLocalEndpoint(ep localEndpointConfig) error {
+	f.upsertedLocalEndpoints = append(f.upsertedLocalEndpoints, ep)
+	return nil
+}
+
+func (f *fakePublishedPortDatapath) RemoveLocalEndpoint(ep localEndpointConfig) error {
+	f.removedLocalEndpoints = append(f.removedLocalEndpoints, ep)
 	return nil
 }
 
@@ -2164,17 +2439,31 @@ func (f *fakePublishedPortDatapath) Close() error {
 }
 
 type fakeEndpointNetkitDatapath struct {
-	attached []string
-	detached []string
+	attached               []string
+	attachedPublishedPorts []bool
+	detached               []string
+	upsertedLocalEndpoints []localEndpointConfig
+	removedLocalEndpoints  []localEndpointConfig
 }
 
-func (f *fakeEndpointNetkitDatapath) AttachEndpoint(hostIf string) error {
+func (f *fakeEndpointNetkitDatapath) AttachEndpoint(hostIf string, options endpointDatapathAttachOptions) error {
 	f.attached = append(f.attached, hostIf)
+	f.attachedPublishedPorts = append(f.attachedPublishedPorts, options.PublishedPorts)
 	return nil
 }
 
 func (f *fakeEndpointNetkitDatapath) DetachEndpoint(hostIf string) error {
 	f.detached = append(f.detached, hostIf)
+	return nil
+}
+
+func (f *fakeEndpointNetkitDatapath) UpsertLocalEndpoint(ep localEndpointConfig) error {
+	f.upsertedLocalEndpoints = append(f.upsertedLocalEndpoints, ep)
+	return nil
+}
+
+func (f *fakeEndpointNetkitDatapath) RemoveLocalEndpoint(ep localEndpointConfig) error {
+	f.removedLocalEndpoints = append(f.removedLocalEndpoints, ep)
 	return nil
 }
 

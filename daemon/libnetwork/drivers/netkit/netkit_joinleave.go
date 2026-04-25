@@ -133,6 +133,15 @@ func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinf
 			_ = d.detachEndpointDatapath(ep)
 		}
 	}()
+	if err := d.upsertLocalEndpointDatapaths(ep); err != nil {
+		_ = d.removeLocalEndpointDatapaths(ep)
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = d.removeLocalEndpointDatapaths(ep)
+		}
+	}()
 	jinfo.DisableGatewayService()
 
 	if err := jinfo.InterfaceName().SetNames(containerIfName, containerVethPrefix, netlabel.GetIfname(epOpts)); err != nil {
@@ -192,6 +201,9 @@ func (d *driver) Leave(nid, eid string) error {
 		return err
 	}
 
+	if err := d.removeLocalEndpointDatapathsLocked(ep); err != nil {
+		return err
+	}
 	if err := d.releaseEndpointPublishedPortsLocked(context.TODO(), ep); err != nil {
 		return err
 	}

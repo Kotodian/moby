@@ -27,6 +27,14 @@
 #define PUBLISHED_IFACE_F_REDIRECT_REPLY 0x1
 #define EGRESS_ENDPOINT_F_MASQUERADE 0x1
 
+struct netkit_hop_jumbo_hdr {
+	__u8 nexthdr;
+	__u8 hdrlen;
+	__u8 tlv_type;
+	__u8 tlv_len;
+	__be32 jumbo_payload_len;
+};
+
 volatile const __u64 host_netns_cookie = 0;
 
 struct published_port_v4_key {
@@ -176,6 +184,24 @@ struct egress_iface_value {
 	__u8 ipv6[16];
 };
 
+struct local_source_value {
+	__u8 network_id[16];
+};
+
+struct local_endpoint_v4_key {
+	__u8 network_id[16];
+	__u32 endpoint_ip;
+};
+
+struct local_endpoint_v6_key {
+	__u8 network_id[16];
+	__u8 endpoint_ip[16];
+};
+
+struct local_endpoint_value {
+	__u32 ifindex;
+};
+
 struct packet_info {
 	__u32 l3_off;
 	__u32 l4_off;
@@ -277,6 +303,27 @@ struct {
 	__type(value, struct egress_iface_value);
 } egress_ifaces SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u32);
+	__type(value, struct local_source_value);
+} local_sources SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct local_endpoint_v4_key);
+	__type(value, struct local_endpoint_value);
+} local_endpoints_v4 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct local_endpoint_v6_key);
+	__type(value, struct local_endpoint_value);
+} local_endpoints_v6 SEC(".maps");
+
 static __always_inline int is_loopback_v4(__be32 addr)
 {
 	return (bpf_ntohl(addr) & 0xff000000U) == 0x7f000000U;
@@ -364,7 +411,7 @@ static __always_inline int parse_ipv6_l4(struct __sk_buff *skb, struct packet_in
 	(void)skb;
 
 	if (ip6h->payload_len == 0 && ip6h->nexthdr == NEXTHDR_HOP) {
-		struct hop_jumbo_hdr *hop = data + pkt->l4_off;
+		struct netkit_hop_jumbo_hdr *hop = data + pkt->l4_off;
 
 		if ((void *)(hop + 1) > data_end)
 			return -1;
@@ -521,6 +568,17 @@ static __always_inline int lookup_published_port_v4(const struct packet_info *pk
 		.flags = loopback,
 	};
 
+	if (loopback == 0) {
+		key.host_ip = 0;
+		*value = bpf_map_lookup_elem(&published_ports_v4, &key);
+		if (*value)
+			return 0;
+
+		key.host_ip = bpf_ntohl(pkt->daddr4);
+		*value = bpf_map_lookup_elem(&published_ports_v4, &key);
+		return *value ? 0 : -1;
+	}
+
 	*value = bpf_map_lookup_elem(&published_ports_v4, &key);
 	if (*value)
 		return 0;
@@ -546,6 +604,17 @@ static __always_inline int lookup_published_port_v6(const struct packet_info *pk
 		.proto = pkt->proto,
 		.flags = loopback,
 	};
+
+	if (loopback == 0) {
+		__builtin_memset(key.host_ip, 0, sizeof(key.host_ip));
+		*value = bpf_map_lookup_elem(&published_ports_v6, &key);
+		if (*value)
+			return 0;
+
+		__builtin_memcpy(key.host_ip, pkt->daddr6.in6_u.u6_addr8, sizeof(key.host_ip));
+		*value = bpf_map_lookup_elem(&published_ports_v6, &key);
+		return *value ? 0 : -1;
+	}
 
 	__builtin_memcpy(key.host_ip, pkt->daddr6.in6_u.u6_addr8, sizeof(key.host_ip));
 	*value = bpf_map_lookup_elem(&published_ports_v6, &key);
@@ -647,6 +716,59 @@ static __always_inline int lookup_egress_endpoint_v6(const struct packet_info *p
 	__builtin_memcpy(key.endpoint_ip, pkt->saddr6.in6_u.u6_addr8, sizeof(key.endpoint_ip));
 	*value = bpf_map_lookup_elem(&egress_endpoints_v6, &key);
 	return *value ? 0 : -1;
+}
+
+static __always_inline int redirect_local_endpoint_v4(__u32 ifindex, const struct packet_info *pkt,
+						      const struct local_source_value *source)
+{
+	struct local_endpoint_v4_key key = {};
+	const struct local_endpoint_value *value;
+
+	__builtin_memcpy(key.network_id, source->network_id, sizeof(key.network_id));
+	key.endpoint_ip = bpf_ntohl(pkt->daddr4);
+	value = bpf_map_lookup_elem(&local_endpoints_v4, &key);
+	if (!value || value->ifindex == 0 || value->ifindex == ifindex)
+		return TCX_NEXT;
+	/*
+	 * netkit/peer already runs while the skb is crossing from the source
+	 * peer into the host-side primary. Redirect to the destination primary;
+	 * netkit xmit then delivers it to that endpoint's peer.
+	 */
+	return bpf_redirect(value->ifindex, 0);
+}
+
+static __always_inline int redirect_local_endpoint_v6(__u32 ifindex, const struct packet_info *pkt,
+						      const struct local_source_value *source)
+{
+	struct local_endpoint_v6_key key = {};
+	const struct local_endpoint_value *value;
+
+	__builtin_memcpy(key.network_id, source->network_id, sizeof(key.network_id));
+	__builtin_memcpy(key.endpoint_ip, pkt->daddr6.in6_u.u6_addr8, sizeof(key.endpoint_ip));
+	value = bpf_map_lookup_elem(&local_endpoints_v6, &key);
+	if (!value || value->ifindex == 0 || value->ifindex == ifindex)
+		return TCX_NEXT;
+	/*
+	 * See the IPv4 path: redirect to the target primary, not to the target
+	 * peer, from a netkit peer hook.
+	 */
+	return bpf_redirect(value->ifindex, 0);
+}
+
+static __always_inline int redirect_local_endpoint(struct __sk_buff *skb, const struct packet_info *pkt)
+{
+	__u32 ifindex = skb->ifindex;
+	const struct local_source_value *source;
+
+	source = bpf_map_lookup_elem(&local_sources, &ifindex);
+	if (!source)
+		return TCX_NEXT;
+
+	if (pkt->family == AF_INET)
+		return redirect_local_endpoint_v4(ifindex, pkt, source);
+	if (pkt->family == AF_INET6)
+		return redirect_local_endpoint_v6(ifindex, pkt, source);
+	return TCX_NEXT;
 }
 
 static __always_inline int lookup_egress_flow_v4(const struct packet_info *pkt,
@@ -1156,40 +1278,52 @@ static __always_inline int rewrite_getpeername_v6(struct bpf_sock_addr *ctx)
 	return 1;
 }
 
-static __always_inline int process_published_ingress(struct __sk_buff *skb)
+static __always_inline int process_published_dnat_ingress(struct __sk_buff *skb,
+							  const struct packet_info *pkt)
 {
-	struct packet_info pkt = {};
-
-	if (parse_packet(skb, &pkt) < 0)
-		return TCX_NEXT;
-
-	if (pkt.family == AF_INET) {
-		const struct published_flow_v4_value *flow;
+	if (pkt->family == AF_INET) {
 		const struct published_port_v4_value *value;
 
-		if (lookup_flow_v4(&pkt, &flow) == 0)
-			return rewrite_snat_v4(skb, &pkt, flow);
-		if (lookup_published_port_v4(&pkt, &value) < 0)
+		if (lookup_published_port_v4(pkt, &value) < 0)
 			return TCX_NEXT;
 
-		netkit_dbg("dnat4 hit %x:%d -> %x:%d", bpf_ntohl(pkt.daddr4), bpf_ntohs(pkt.dport),
+		netkit_dbg("dnat4 hit %x:%d -> %x:%d", bpf_ntohl(pkt->daddr4), bpf_ntohs(pkt->dport),
 			   value->endpoint_ip, value->endpoint_port);
-		remember_flow_v4(skb, &pkt, value);
-		return rewrite_dnat_v4(skb, &pkt, value);
+		remember_flow_v4(skb, pkt, value);
+		return rewrite_dnat_v4(skb, pkt, value);
 	}
 
-	if (pkt.family == AF_INET6) {
-		const struct published_flow_v6_value *flow;
+	if (pkt->family == AF_INET6) {
 		const struct published_port_v6_value *value;
 
-		if (lookup_flow_v6(&pkt, &flow) == 0)
-			return rewrite_snat_v6(skb, &pkt, flow);
-		if (lookup_published_port_v6(&pkt, &value) < 0)
+		if (lookup_published_port_v6(pkt, &value) < 0)
 			return TCX_NEXT;
 
-		netkit_dbg("dnat6 hit port %d -> %d", bpf_ntohs(pkt.dport), value->endpoint_port);
-		remember_flow_v6(skb, &pkt, value);
-		return rewrite_dnat_v6(skb, &pkt, value);
+		netkit_dbg("dnat6 hit port %d -> %d", bpf_ntohs(pkt->dport), value->endpoint_port);
+		remember_flow_v6(skb, pkt, value);
+		return rewrite_dnat_v6(skb, pkt, value);
+	}
+
+	return TCX_NEXT;
+}
+
+static __always_inline int process_published_ingress(struct __sk_buff *skb,
+						     const struct packet_info *pkt)
+{
+	if (pkt->family == AF_INET) {
+		const struct published_flow_v4_value *flow;
+
+		if (lookup_flow_v4(pkt, &flow) == 0)
+			return rewrite_snat_v4(skb, pkt, flow);
+		return process_published_dnat_ingress(skb, pkt);
+	}
+
+	if (pkt->family == AF_INET6) {
+		const struct published_flow_v6_value *flow;
+
+		if (lookup_flow_v6(pkt, &flow) == 0)
+			return rewrite_snat_v6(skb, pkt, flow);
+		return process_published_dnat_ingress(skb, pkt);
 	}
 
 	return TCX_NEXT;
@@ -1215,76 +1349,67 @@ static __always_inline int match_published_v6(const struct packet_info *pkt)
 	return lookup_published_port_v6(pkt, &value) == 0;
 }
 
-static __always_inline int process_published_egress(struct __sk_buff *skb)
+static __always_inline int process_published_egress(struct __sk_buff *skb,
+						    const struct packet_info *pkt)
 {
-	struct packet_info pkt = {};
+	if (pkt->family == AF_INET)
+		netkit_dbg("egress4 tuple %x:%d -> %x:%d", bpf_ntohl(pkt->saddr4), bpf_ntohs(pkt->sport),
+			   bpf_ntohl(pkt->daddr4), bpf_ntohs(pkt->dport));
+	else if (pkt->family == AF_INET6)
+		netkit_dbg("egress6 tuple %d -> %d", bpf_ntohs(pkt->sport), bpf_ntohs(pkt->dport));
 
-	if (parse_packet(skb, &pkt) < 0) {
-		netkit_dbg("egress parse fail proto=%d", bpf_ntohs(skb->protocol));
-		return TCX_NEXT;
-	}
-
-	if (pkt.family == AF_INET)
-		netkit_dbg("egress4 tuple %x:%d -> %x:%d", bpf_ntohl(pkt.saddr4), bpf_ntohs(pkt.sport),
-			   bpf_ntohl(pkt.daddr4), bpf_ntohs(pkt.dport));
-	else if (pkt.family == AF_INET6)
-		netkit_dbg("egress6 tuple %d -> %d", bpf_ntohs(pkt.sport), bpf_ntohs(pkt.dport));
-
-	if (pkt.family == AF_INET) {
+	if (pkt->family == AF_INET) {
 		const struct published_flow_v4_value *flow;
 
-		if (lookup_flow_v4(&pkt, &flow) < 0) {
-			netkit_dbg("egress4 miss %x:%d -> %x:%d", bpf_ntohl(pkt.saddr4), bpf_ntohs(pkt.sport),
-				   bpf_ntohl(pkt.daddr4), bpf_ntohs(pkt.dport));
+		if (lookup_flow_v4(pkt, &flow) < 0) {
+			netkit_dbg("egress4 miss %x:%d -> %x:%d", bpf_ntohl(pkt->saddr4), bpf_ntohs(pkt->sport),
+				   bpf_ntohl(pkt->daddr4), bpf_ntohs(pkt->dport));
 			return TCX_NEXT;
 		}
 
-		return rewrite_snat_v4(skb, &pkt, flow);
+		return rewrite_snat_v4(skb, pkt, flow);
 	}
 
-	if (pkt.family == AF_INET6) {
+	if (pkt->family == AF_INET6) {
 		const struct published_flow_v6_value *flow;
 
-		if (lookup_flow_v6(&pkt, &flow) < 0) {
-			netkit_dbg("egress6 miss %d -> %d", bpf_ntohs(pkt.sport), bpf_ntohs(pkt.dport));
+		if (lookup_flow_v6(pkt, &flow) < 0) {
+			netkit_dbg("egress6 miss %d -> %d", bpf_ntohs(pkt->sport), bpf_ntohs(pkt->dport));
 			return TCX_NEXT;
 		}
 
-		return rewrite_snat_v6(skb, &pkt, flow);
+		return rewrite_snat_v6(skb, pkt, flow);
 	}
 
 	return TCX_NEXT;
 }
 
-static __always_inline int process_host_facing_ingress(struct __sk_buff *skb)
+static __always_inline int process_host_facing_ingress(struct __sk_buff *skb,
+						       const struct packet_info *pkt)
 {
-	struct packet_info pkt = {};
-
-	if (parse_packet(skb, &pkt) < 0)
-		return TCX_NEXT;
-
-	if (pkt.family == AF_INET) {
+	if (pkt->family == AF_INET) {
 		const struct egress_flow_v4_value *flow;
 
-		if (lookup_egress_flow_v4(&pkt, &flow) == 0) {
+		if (lookup_egress_flow_v4(pkt, &flow) == 0) {
 			netkit_dbg("host ingress flow4 hit");
-			return rewrite_egress_return_v4(skb, &pkt, flow);
+			return rewrite_egress_return_v4(skb, pkt, flow);
 		}
 	}
 
-	if (pkt.family == AF_INET6) {
+	if (pkt->family == AF_INET6) {
 		const struct egress_flow_v6_value *flow;
 
-		if (lookup_egress_flow_v6(&pkt, &flow) == 0)
-			return rewrite_egress_return_v6(skb, &pkt, flow);
+		if (lookup_egress_flow_v6(pkt, &flow) == 0)
+			return rewrite_egress_return_v6(skb, pkt, flow);
 	}
 
-	return process_published_ingress(skb);
+	return process_published_dnat_ingress(skb, pkt);
 }
 
-static __always_inline int process_internal_ingress(struct __sk_buff *skb)
+static __always_inline int process_internal_ingress(struct __sk_buff *skb,
+						    const struct packet_info *pkt)
 {
-	return process_published_ingress(skb);
+	return process_published_ingress(skb, pkt);
 }
 
 /*
@@ -1318,24 +1443,20 @@ static __always_inline int process_internal_ingress(struct __sk_buff *skb)
  * stack/scalar state and avoids a second ctx-field load in the deep egress
  * path.
  */
-static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u32 ifindex)
+static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u32 ifindex,
+						      const struct packet_info *pkt)
 {
-	struct packet_info pkt = {};
-
-	if (parse_packet(skb, &pkt) < 0)
-		return TCX_NEXT;
-
-	if (pkt.family == AF_INET) {
+	if (pkt->family == AF_INET) {
 		const struct published_flow_v4_value *published;
 		const struct egress_endpoint_v4_value *endpoint;
 		__u32 host_ip;
 
-		netkit_dbg("host egress4 tuple %x:%d -> %x:%d", bpf_ntohl(pkt.saddr4), bpf_ntohs(pkt.sport),
-			   bpf_ntohl(pkt.daddr4), bpf_ntohs(pkt.dport));
-		if (lookup_flow_v4(&pkt, &published) == 0)
-			return rewrite_snat_v4(skb, &pkt, published);
-		if (lookup_egress_endpoint_v4(&pkt, &endpoint) < 0) {
-			netkit_dbg("host egress4 endpoint miss src=%x", bpf_ntohl(pkt.saddr4));
+		netkit_dbg("host egress4 tuple %x:%d -> %x:%d", bpf_ntohl(pkt->saddr4), bpf_ntohs(pkt->sport),
+			   bpf_ntohl(pkt->daddr4), bpf_ntohs(pkt->dport));
+		if (lookup_flow_v4(pkt, &published) == 0)
+			return rewrite_snat_v4(skb, pkt, published);
+		if (lookup_egress_endpoint_v4(pkt, &endpoint) < 0) {
+			netkit_dbg("host egress4 endpoint miss src=%x", bpf_ntohl(pkt->saddr4));
 			return TCX_NEXT;
 		}
 		if (resolve_egress_ipv4(ifindex, endpoint, &host_ip) < 0) {
@@ -1344,27 +1465,27 @@ static __always_inline int process_host_facing_egress(struct __sk_buff *skb, __u
 		}
 
 		netkit_dbg("host egress4 snat host=%x", host_ip);
-		if (apply_egress_snat_v4(skb, &pkt, host_ip) < 0)
+		if (apply_egress_snat_v4(skb, pkt, host_ip) < 0)
 			return TCX_NEXT;
-		remember_egress_flow_v4(&pkt, host_ip, 0);
+		remember_egress_flow_v4(pkt, host_ip, 0);
 		return TCX_NEXT;
 	}
 
-	if (pkt.family == AF_INET6) {
+	if (pkt->family == AF_INET6) {
 		const struct published_flow_v6_value *published;
 		const struct egress_endpoint_v6_value *endpoint;
 		__u8 host_ip[16];
 
-		if (lookup_flow_v6(&pkt, &published) == 0)
-			return rewrite_snat_v6(skb, &pkt, published);
-		if (lookup_egress_endpoint_v6(&pkt, &endpoint) < 0)
+		if (lookup_flow_v6(pkt, &published) == 0)
+			return rewrite_snat_v6(skb, pkt, published);
+		if (lookup_egress_endpoint_v6(pkt, &endpoint) < 0)
 			return TCX_NEXT;
 		if (resolve_egress_ipv6(ifindex, endpoint, host_ip) < 0)
 			return TCX_NEXT;
 
-		if (apply_egress_snat_v6(skb, &pkt, host_ip) < 0)
+		if (apply_egress_snat_v6(skb, pkt, host_ip) < 0)
 			return TCX_NEXT;
-		remember_egress_flow_v6(&pkt, host_ip, 0);
+		remember_egress_flow_v6(pkt, host_ip, 0);
 		return TCX_NEXT;
 	}
 
@@ -1454,34 +1575,40 @@ static __always_inline int redirect_endpoint_egress_v6(struct __sk_buff *skb,
 	return bpf_redirect_neigh(fib.ifindex, &neigh, sizeof(neigh), 0);
 }
 
-static __always_inline int process_endpoint_egress(struct __sk_buff *skb)
+static __always_inline int process_endpoint_external_egress(struct __sk_buff *skb,
+							    const struct packet_info *pkt)
 {
-	struct packet_info pkt = {};
-
-	if (parse_packet(skb, &pkt) < 0)
-		return TCX_NEXT;
-
-	if (pkt.family == AF_INET) {
+	if (pkt->family == AF_INET) {
 		const struct egress_endpoint_v4_value *endpoint;
 
-		if (lookup_egress_endpoint_v4(&pkt, &endpoint) < 0) {
-			netkit_dbg("endpoint egress4 endpoint miss src=%x", bpf_ntohl(pkt.saddr4));
+		if (lookup_egress_endpoint_v4(pkt, &endpoint) < 0) {
+			netkit_dbg("endpoint egress4 endpoint miss src=%x", bpf_ntohl(pkt->saddr4));
 			return TCX_NEXT;
 		}
-		return redirect_endpoint_egress_v4(skb, &pkt, endpoint);
+		return redirect_endpoint_egress_v4(skb, pkt, endpoint);
 	}
 
-	if (pkt.family == AF_INET6) {
+	if (pkt->family == AF_INET6) {
 		const struct egress_endpoint_v6_value *endpoint;
 
-		if (lookup_egress_endpoint_v6(&pkt, &endpoint) < 0) {
+		if (lookup_egress_endpoint_v6(pkt, &endpoint) < 0) {
 			netkit_dbg("endpoint egress6 endpoint miss");
 			return TCX_NEXT;
 		}
-		return redirect_endpoint_egress_v6(skb, &pkt, endpoint);
+		return redirect_endpoint_egress_v6(skb, pkt, endpoint);
 	}
 
 	return TCX_NEXT;
+}
+
+static __always_inline int process_endpoint_egress(struct __sk_buff *skb,
+						   const struct packet_info *pkt)
+{
+	int ret = redirect_local_endpoint(skb, pkt);
+	if (ret != TCX_NEXT)
+		return ret;
+
+	return process_endpoint_external_egress(skb, pkt);
 }
 
 static __always_inline int tcx_to_netkit_action(int action)
@@ -1494,13 +1621,16 @@ static __always_inline int tcx_to_netkit_action(int action)
 SEC("tcx/ingress")
 int portmap_ingress(struct __sk_buff *skb)
 {
+	struct packet_info pkt = {};
 	__u32 ifindex = skb->ifindex;
 	int host_facing = iface_is_host_facing(ifindex);
 
 	netkit_dbg("ingress ifindex=%d host=%d", ifindex, host_facing);
+	if (parse_packet(skb, &pkt) < 0)
+		return TCX_NEXT;
 	if (host_facing)
-		return process_host_facing_ingress(skb);
-	return process_internal_ingress(skb);
+		return process_host_facing_ingress(skb, &pkt);
+	return process_internal_ingress(skb, &pkt);
 }
 
 SEC("tcx/egress")
@@ -1516,29 +1646,78 @@ int portmap_egress(struct __sk_buff *skb)
 	 * so the deep egress path can reuse w7 instead of emitting another
 	 * "*(u32 *)(ctx + 0x28)" load around resolve_egress_ipv4/ipv6().
 	 */
+	struct packet_info pkt = {};
 	__u32 ifindex = skb->ifindex;
 	int host_facing = iface_is_host_facing(ifindex);
 
 	netkit_dbg("egress ifindex=%d host=%d", ifindex, host_facing);
+	if (parse_packet(skb, &pkt) < 0) {
+		netkit_dbg("egress parse fail proto=%d", bpf_ntohs(skb->protocol));
+		return TCX_NEXT;
+	}
 	if (host_facing)
-		return process_host_facing_egress(skb, ifindex);
-	return process_published_egress(skb);
+		return process_host_facing_egress(skb, ifindex, &pkt);
+	return process_published_egress(skb, &pkt);
 }
 
 SEC("netkit/primary")
 int endpoint_primary(struct __sk_buff *skb)
 {
-	return tcx_to_netkit_action(process_published_ingress(skb));
+	struct packet_info pkt = {};
+
+	if (parse_packet(skb, &pkt) < 0)
+		return tcx_to_netkit_action(TCX_NEXT);
+	return tcx_to_netkit_action(process_published_ingress(skb, &pkt));
+}
+
+SEC("netkit/primary")
+int endpoint_primary_pass(struct __sk_buff *skb)
+{
+	(void)skb;
+	return NETKIT_PASS;
 }
 
 SEC("netkit/peer")
 int endpoint_peer(struct __sk_buff *skb)
 {
-	int ret = process_published_egress(skb);
+	struct packet_info pkt = {};
+	int ret;
 
+	if (parse_packet(skb, &pkt) < 0) {
+		netkit_dbg("egress parse fail proto=%d", bpf_ntohs(skb->protocol));
+		return tcx_to_netkit_action(TCX_NEXT);
+	}
+
+	ret = redirect_local_endpoint(skb, &pkt);
 	if (ret != TCX_NEXT)
 		return tcx_to_netkit_action(ret);
-	return tcx_to_netkit_action(process_endpoint_egress(skb));
+
+	ret = process_published_egress(skb, &pkt);
+	if (ret != TCX_NEXT)
+		return tcx_to_netkit_action(ret);
+	return tcx_to_netkit_action(process_endpoint_external_egress(skb, &pkt));
+}
+
+SEC("netkit/peer")
+int endpoint_peer_published(struct __sk_buff *skb)
+{
+	struct packet_info pkt = {};
+	int ret;
+
+	if (parse_packet(skb, &pkt) < 0) {
+		netkit_dbg("egress parse fail proto=%d", bpf_ntohs(skb->protocol));
+		return tcx_to_netkit_action(TCX_NEXT);
+	}
+
+	ret = process_published_egress(skb, &pkt);
+	if (ret != TCX_NEXT)
+		return tcx_to_netkit_action(ret);
+
+	ret = redirect_local_endpoint(skb, &pkt);
+	if (ret != TCX_NEXT)
+		return tcx_to_netkit_action(ret);
+
+	return tcx_to_netkit_action(process_endpoint_external_egress(skb, &pkt));
 }
 
 SEC("cgroup/connect4")

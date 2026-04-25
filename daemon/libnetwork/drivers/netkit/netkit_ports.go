@@ -165,6 +165,7 @@ func (d *driver) ProgramExternalConnectivity(ctx context.Context, nid, eid strin
 		return nil
 	}
 
+	createdParent := false
 	if ep.publishedParent == "" {
 		rt, err := d.acquireParentRuntimeLocked(ctx, publishedPortScopeKey(n))
 		if err != nil {
@@ -175,6 +176,18 @@ func (d *driver) ProgramExternalConnectivity(ctx context.Context, nid, eid strin
 			return err
 		}
 		ep.publishedParent = publishedPortScopeKey(n)
+		createdParent = true
+	}
+
+	if err := d.ensureEndpointDatapathPublishedPortsLocked(ep); err != nil {
+		if createdParent {
+			if pr := d.parents[ep.publishedParent]; pr != nil {
+				_ = pr.runtime.DelEndpoint(ctx, publishedEndpointConfigForEndpoint(ep))
+			}
+			_ = d.releaseParentRuntimeLocked(ctx, ep.publishedParent)
+			ep.publishedParent = ""
+		}
+		return err
 	}
 
 	pr := d.parents[ep.publishedParent]
@@ -299,8 +312,90 @@ func (d *driver) acquirePublishedPortDatapathLocked(ctx context.Context, parent 
 	if err != nil {
 		return nil, false, err
 	}
+	if err := d.syncLocalEndpointsToPublishedDatapath(datapath); err != nil {
+		_ = datapath.Close()
+		return nil, false, err
+	}
 	d.datapath = datapath
 	return datapath, true, nil
+}
+
+func (d *driver) upsertLocalEndpointDatapaths(ep *endpoint) error {
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
+	return d.upsertLocalEndpointDatapathsLocked(ep)
+}
+
+func (d *driver) upsertLocalEndpointDatapathsLocked(ep *endpoint) error {
+	config, ok := localEndpointConfigForEndpoint(ep)
+	if !ok {
+		return nil
+	}
+
+	var errs []error
+	if d.datapath != nil {
+		errs = append(errs, d.datapath.UpsertLocalEndpoint(config))
+	}
+	d.mu.Lock()
+	endpointDatapath := d.endpointDatapath
+	d.mu.Unlock()
+	if endpointDatapath != nil {
+		errs = append(errs, endpointDatapath.UpsertLocalEndpoint(config))
+	}
+	return errors.Join(errs...)
+}
+
+func (d *driver) removeLocalEndpointDatapaths(ep *endpoint) error {
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
+	return d.removeLocalEndpointDatapathsLocked(ep)
+}
+
+func (d *driver) removeLocalEndpointDatapathsLocked(ep *endpoint) error {
+	config, ok := localEndpointConfigForEndpoint(ep)
+	if !ok {
+		return nil
+	}
+
+	var errs []error
+	if d.datapath != nil {
+		errs = append(errs, d.datapath.RemoveLocalEndpoint(config))
+	}
+	d.mu.Lock()
+	endpointDatapath := d.endpointDatapath
+	d.mu.Unlock()
+	if endpointDatapath != nil {
+		errs = append(errs, endpointDatapath.RemoveLocalEndpoint(config))
+	}
+	return errors.Join(errs...)
+}
+
+func (d *driver) syncLocalEndpointsToPublishedDatapath(datapath publishedPortDatapath) error {
+	var errs []error
+	for _, n := range d.getNetworks() {
+		n.mu.Lock()
+		for _, ep := range n.endpoints {
+			if config, ok := localEndpointConfigForEndpoint(ep); ok {
+				errs = append(errs, datapath.UpsertLocalEndpoint(config))
+			}
+		}
+		n.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}
+
+func (d *driver) syncLocalEndpointsToEndpointDatapath(datapath endpointNetkitDatapath) error {
+	var errs []error
+	for _, n := range d.getNetworks() {
+		n.mu.Lock()
+		for _, ep := range n.endpoints {
+			if config, ok := localEndpointConfigForEndpoint(ep); ok {
+				errs = append(errs, datapath.UpsertLocalEndpoint(config))
+			}
+		}
+		n.mu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 func (d *driver) releaseParentRuntimeLocked(ctx context.Context, parent string) error {

@@ -111,6 +111,13 @@ func (d *driver) populateEndpoints() error {
 				"nid":   ep.nid,
 			}).Warn("Failed to attach netkit endpoint datapath during restore")
 		}
+		if err := d.upsertLocalEndpointDatapaths(ep); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error": err,
+				"ep.id": ep.id,
+				"nid":   ep.nid,
+			}).Warn("Failed to restore netkit local endpoint datapath")
+		}
 	}
 
 	return nil

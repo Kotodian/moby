@@ -6,6 +6,7 @@ package netkit
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,12 +31,14 @@ const egressEndpointFlagMasquerade = 1 << 0
 const publishedPortCgroupPath = "/sys/fs/cgroup"
 
 type publishedPortDatapath interface {
-	AttachEndpoint(hostIf string) error
+	AttachEndpoint(hostIf string, options endpointDatapathAttachOptions) error
 	DetachEndpoint(hostIf string) error
 	AddParent(parent string) error
 	RemoveParent(parent string) error
 	UpsertEgressEndpoint(ep egressEndpointConfig) error
 	RemoveEgressEndpoint(ep egressEndpointConfig) error
+	UpsertLocalEndpoint(ep localEndpointConfig) error
+	RemoveLocalEndpoint(ep localEndpointConfig) error
 	AddPublishedEndpoint(ep publishedEndpointConfig) error
 	RemovePublishedEndpoint(ep publishedEndpointConfig) error
 	AddBindings(bindings []portmapperapi.PortBinding) error
@@ -68,6 +71,15 @@ type egressEndpointConfig struct {
 	MasqueradeIPv6  bool
 }
 
+type localEndpointConfig struct {
+	NetworkID       string
+	NetworkKey      [16]byte
+	HostIf          string
+	EndpointIfindex uint32
+	Addr            *net.IPNet
+	Addrv6          *net.IPNet
+}
+
 type ebpfPublishedPortDatapath struct {
 	mu sync.Mutex
 
@@ -76,34 +88,39 @@ type ebpfPublishedPortDatapath struct {
 	globalIfindices            map[int]struct{}
 	parentLinks                map[string][]link.Link
 	parentAttachments          map[string][]publishedPortTCXAttachment
-	endpointLinks              map[string][]link.Link
+	endpointLinks              map[string]endpointNetkitLinks
 	publishedEndpointIfindexV4 map[uint32]uint32
 	publishedEndpointIfindexV6 map[[16]byte]uint32
 }
 
 type netkitPortmapHandles struct {
-	EndpointPrimary   *ebpf.Program `ebpf:"endpoint_primary"`
-	EndpointPeer      *ebpf.Program `ebpf:"endpoint_peer"`
-	PortmapIngress    *ebpf.Program `ebpf:"portmap_ingress"`
-	PortmapEgress     *ebpf.Program `ebpf:"portmap_egress"`
-	Connect4          *ebpf.Program `ebpf:"connect4"`
-	Connect6          *ebpf.Program `ebpf:"connect6"`
-	Sendmsg4          *ebpf.Program `ebpf:"sendmsg4"`
-	Sendmsg6          *ebpf.Program `ebpf:"sendmsg6"`
-	Getpeername4      *ebpf.Program `ebpf:"getpeername4"`
-	Getpeername6      *ebpf.Program `ebpf:"getpeername6"`
-	EgressEndpointsV4 *ebpf.Map     `ebpf:"egress_endpoints_v4"`
-	EgressEndpointsV6 *ebpf.Map     `ebpf:"egress_endpoints_v6"`
-	EgressFlowsV4     *ebpf.Map     `ebpf:"egress_flows_v4"`
-	EgressFlowsV6     *ebpf.Map     `ebpf:"egress_flows_v6"`
-	EgressIfaces      *ebpf.Map     `ebpf:"egress_ifaces"`
-	PublishedPortsV4  *ebpf.Map     `ebpf:"published_ports_v4"`
-	PublishedPortsV6  *ebpf.Map     `ebpf:"published_ports_v6"`
-	PublishedFlowsV4  *ebpf.Map     `ebpf:"published_flows_v4"`
-	PublishedFlowsV6  *ebpf.Map     `ebpf:"published_flows_v6"`
-	PublishedSockV4   *ebpf.Map     `ebpf:"published_sock_v4"`
-	PublishedSockV6   *ebpf.Map     `ebpf:"published_sock_v6"`
-	PublishedIfaces   *ebpf.Map     `ebpf:"published_ifaces"`
+	EndpointPrimary       *ebpf.Program `ebpf:"endpoint_primary"`
+	EndpointPrimaryPass   *ebpf.Program `ebpf:"endpoint_primary_pass"`
+	EndpointPeer          *ebpf.Program `ebpf:"endpoint_peer"`
+	EndpointPeerPublished *ebpf.Program `ebpf:"endpoint_peer_published"`
+	PortmapIngress        *ebpf.Program `ebpf:"portmap_ingress"`
+	PortmapEgress         *ebpf.Program `ebpf:"portmap_egress"`
+	Connect4              *ebpf.Program `ebpf:"connect4"`
+	Connect6              *ebpf.Program `ebpf:"connect6"`
+	Sendmsg4              *ebpf.Program `ebpf:"sendmsg4"`
+	Sendmsg6              *ebpf.Program `ebpf:"sendmsg6"`
+	Getpeername4          *ebpf.Program `ebpf:"getpeername4"`
+	Getpeername6          *ebpf.Program `ebpf:"getpeername6"`
+	EgressEndpointsV4     *ebpf.Map     `ebpf:"egress_endpoints_v4"`
+	EgressEndpointsV6     *ebpf.Map     `ebpf:"egress_endpoints_v6"`
+	EgressFlowsV4         *ebpf.Map     `ebpf:"egress_flows_v4"`
+	EgressFlowsV6         *ebpf.Map     `ebpf:"egress_flows_v6"`
+	EgressIfaces          *ebpf.Map     `ebpf:"egress_ifaces"`
+	LocalSources          *ebpf.Map     `ebpf:"local_sources"`
+	LocalEndpointsV4      *ebpf.Map     `ebpf:"local_endpoints_v4"`
+	LocalEndpointsV6      *ebpf.Map     `ebpf:"local_endpoints_v6"`
+	PublishedPortsV4      *ebpf.Map     `ebpf:"published_ports_v4"`
+	PublishedPortsV6      *ebpf.Map     `ebpf:"published_ports_v6"`
+	PublishedFlowsV4      *ebpf.Map     `ebpf:"published_flows_v4"`
+	PublishedFlowsV6      *ebpf.Map     `ebpf:"published_flows_v6"`
+	PublishedSockV4       *ebpf.Map     `ebpf:"published_sock_v4"`
+	PublishedSockV6       *ebpf.Map     `ebpf:"published_sock_v6"`
+	PublishedIfaces       *ebpf.Map     `ebpf:"published_ifaces"`
 }
 
 type publishedPortTCXAttachment struct {
@@ -258,6 +275,24 @@ type egressIfaceValue struct {
 	IPv6 [16]byte
 }
 
+type localSourceValue struct {
+	NetworkID [16]byte
+}
+
+type localEndpointV4Key struct {
+	NetworkID  [16]byte
+	EndpointIP uint32
+}
+
+type localEndpointV6Key struct {
+	NetworkID  [16]byte
+	EndpointIP [16]byte
+}
+
+type localEndpointValue struct {
+	Ifindex uint32
+}
+
 func newEBPFPublishedPortDatapath(_ context.Context, scope string) (publishedPortDatapath, error) {
 	_ = scope
 
@@ -283,7 +318,7 @@ func newEBPFPublishedPortDatapath(_ context.Context, scope string) (publishedPor
 		globalIfindices:            map[int]struct{}{},
 		parentLinks:                map[string][]link.Link{},
 		parentAttachments:          map[string][]publishedPortTCXAttachment{},
-		endpointLinks:              map[string][]link.Link{},
+		endpointLinks:              map[string]endpointNetkitLinks{},
 		publishedEndpointIfindexV4: map[uint32]uint32{},
 		publishedEndpointIfindexV6: map[[16]byte]uint32{},
 	}
@@ -490,7 +525,7 @@ func (d *ebpfPublishedPortDatapath) attach(ifindex int, attachType ebpf.AttachTy
 	return lnk, nil
 }
 
-func (d *ebpfPublishedPortDatapath) AttachEndpoint(hostIf string) error {
+func (d *ebpfPublishedPortDatapath) AttachEndpoint(hostIf string, options endpointDatapathAttachOptions) error {
 	if strings.TrimSpace(hostIf) == "" {
 		return nil
 	}
@@ -498,43 +533,105 @@ func (d *ebpfPublishedPortDatapath) AttachEndpoint(hostIf string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if _, ok := d.endpointLinks[hostIf]; ok {
-		return nil
-	}
-
 	hostLink, err := hostLinkByName(hostIf)
 	if err != nil {
 		return fmt.Errorf("resolve netkit primary %q: %w", hostIf, err)
 	}
 	ifindex := hostLink.Attrs().Index
 
+	if attachment, ok := d.endpointLinks[hostIf]; ok {
+		if attachment.publishedPorts == options.PublishedPorts {
+			return nil
+		}
+		updated, err := d.replaceEndpointPrograms(hostIf, ifindex, attachment, options)
+		if updated.primary != nil || updated.peer != nil {
+			d.endpointLinks[hostIf] = updated
+		} else {
+			delete(d.endpointLinks, hostIf)
+		}
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	attachment, err := d.attachEndpointPrograms(hostIf, ifindex, options)
+	if err != nil {
+		return err
+	}
+
+	d.endpointLinks[hostIf] = attachment
+	return nil
+}
+
+func (d *ebpfPublishedPortDatapath) replaceEndpointPrograms(hostIf string, ifindex int, attachment endpointNetkitLinks, options endpointDatapathAttachOptions) (endpointNetkitLinks, error) {
+	oldOptions := endpointDatapathAttachOptions{PublishedPorts: attachment.publishedPorts}
+	_ = closeEndpointNetkitLinks(attachment)
+	updated, err := d.attachEndpointPrograms(hostIf, ifindex, options)
+	if err != nil {
+		if rollback, rollbackErr := d.attachEndpointPrograms(hostIf, ifindex, oldOptions); rollbackErr == nil {
+			return rollback, err
+		}
+		return endpointNetkitLinks{}, err
+	}
+	return updated, nil
+}
+
+func (d *ebpfPublishedPortDatapath) attachEndpointPrograms(hostIf string, ifindex int, options endpointDatapathAttachOptions) (endpointNetkitLinks, error) {
+	primary, err := d.attachPrimary(hostIf, ifindex, options)
+	if err != nil {
+		return endpointNetkitLinks{}, err
+	}
+
+	peer, err := d.attachPeer(hostIf, ifindex, options)
+	if err != nil {
+		_ = primary.Close()
+		return endpointNetkitLinks{}, err
+	}
+
+	return endpointNetkitLinks{
+		primary:        primary,
+		peer:           peer,
+		publishedPorts: options.PublishedPorts,
+	}, nil
+}
+
+func (d *ebpfPublishedPortDatapath) attachPrimary(hostIf string, ifindex int, options endpointDatapathAttachOptions) (link.Link, error) {
+	primaryProgram := d.handles.EndpointPrimaryPass
+	if options.PublishedPorts {
+		primaryProgram = d.handles.EndpointPrimary
+	}
 	primary, err := attachNetkit(link.NetkitOptions{
 		Interface: ifindex,
-		Program:   d.handles.EndpointPrimary,
+		Program:   primaryProgram,
 		Attach:    ebpf.AttachNetkitPrimary,
 	})
 	if err != nil {
-		return classifyEndpointNetkitDatapathError(
+		return nil, classifyEndpointNetkitDatapathError(
 			fmt.Sprintf("attach netkit primary program to %s", hostIf),
 			err,
 		)
 	}
+	return primary, nil
+}
 
+func (d *ebpfPublishedPortDatapath) attachPeer(hostIf string, ifindex int, options endpointDatapathAttachOptions) (link.Link, error) {
+	peerProgram := d.handles.EndpointPeer
+	if options.PublishedPorts {
+		peerProgram = d.handles.EndpointPeerPublished
+	}
 	peer, err := attachNetkit(link.NetkitOptions{
 		Interface: ifindex,
-		Program:   d.handles.EndpointPeer,
+		Program:   peerProgram,
 		Attach:    ebpf.AttachNetkitPeer,
 	})
 	if err != nil {
-		_ = primary.Close()
-		return classifyEndpointNetkitDatapathError(
+		return nil, classifyEndpointNetkitDatapathError(
 			fmt.Sprintf("attach netkit peer program to %s", hostIf),
 			err,
 		)
 	}
-
-	d.endpointLinks[hostIf] = []link.Link{primary, peer}
-	return nil
+	return peer, nil
 }
 
 func (d *ebpfPublishedPortDatapath) DetachEndpoint(hostIf string) error {
@@ -545,9 +642,9 @@ func (d *ebpfPublishedPortDatapath) DetachEndpoint(hostIf string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	links := d.endpointLinks[hostIf]
+	attachment := d.endpointLinks[hostIf]
 	delete(d.endpointLinks, hostIf)
-	return closeLinks(links)
+	return closeEndpointNetkitLinks(attachment)
 }
 
 func (d *ebpfPublishedPortDatapath) AddBindings(bindings []portmapperapi.PortBinding) error {
@@ -707,6 +804,20 @@ func (d *ebpfPublishedPortDatapath) RemoveEgressEndpoint(ep egressEndpointConfig
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (d *ebpfPublishedPortDatapath) UpsertLocalEndpoint(ep localEndpointConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return upsertLocalEndpoint(d.handles.LocalSources, d.handles.LocalEndpointsV4, d.handles.LocalEndpointsV6, ep)
+}
+
+func (d *ebpfPublishedPortDatapath) RemoveLocalEndpoint(ep localEndpointConfig) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return removeLocalEndpoint(d.handles.LocalSources, d.handles.LocalEndpointsV4, d.handles.LocalEndpointsV6, ep)
 }
 
 func (d *ebpfPublishedPortDatapath) RemoveBindings(bindings []portmapperapi.PortBinding) error {
@@ -1053,8 +1164,8 @@ func (d *ebpfPublishedPortDatapath) Close() error {
 	}
 	d.parentLinks = map[string][]link.Link{}
 	d.parentAttachments = map[string][]publishedPortTCXAttachment{}
-	for hostIf, links := range d.endpointLinks {
-		errs = append(errs, closeLinks(links))
+	for hostIf, attachment := range d.endpointLinks {
+		errs = append(errs, closeEndpointNetkitLinks(attachment))
 		delete(d.endpointLinks, hostIf)
 	}
 	errs = append(errs, closeLinks(d.globalLinks))
@@ -1074,6 +1185,9 @@ func (d *ebpfPublishedPortDatapath) Close() error {
 
 func (h *netkitPortmapHandles) Close() error {
 	return errors.Join(
+		closeMap(h.LocalEndpointsV6),
+		closeMap(h.LocalEndpointsV4),
+		closeMap(h.LocalSources),
 		closeMap(h.EgressIfaces),
 		closeMap(h.EgressFlowsV6),
 		closeMap(h.EgressFlowsV4),
@@ -1094,7 +1208,9 @@ func (h *netkitPortmapHandles) Close() error {
 		closeProgram(h.Connect4),
 		closeProgram(h.PortmapIngress),
 		closeProgram(h.PortmapEgress),
+		closeProgram(h.EndpointPrimaryPass),
 		closeProgram(h.EndpointPrimary),
+		closeProgram(h.EndpointPeerPublished),
 		closeProgram(h.EndpointPeer),
 	)
 }
@@ -1102,7 +1218,9 @@ func (h *netkitPortmapHandles) Close() error {
 func closeLinks(links []link.Link) error {
 	var errs []error
 	for _, lnk := range links {
-		errs = append(errs, lnk.Close())
+		if lnk != nil {
+			errs = append(errs, lnk.Close())
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -1236,6 +1354,125 @@ func egressEndpointEntryV6(ep egressEndpointConfig) (egressEndpointV6Key, egress
 		return egressEndpointV6Key{}, egressEndpointV6Value{}, false, fmt.Errorf("invalid ipv6 snat address %v", ep.HostIPv6)
 	}
 	return key, value, true, nil
+}
+
+func localEndpointConfigForEndpoint(ep *endpoint) (localEndpointConfig, bool) {
+	if ep == nil || strings.TrimSpace(ep.nid) == "" || strings.TrimSpace(ep.hostIf) == "" {
+		return localEndpointConfig{}, false
+	}
+	key := sha256.Sum256([]byte(ep.nid))
+	config := localEndpointConfig{
+		NetworkID: ep.nid,
+		HostIf:    ep.hostIf,
+		Addr:      cloneIPNet(ep.addr),
+		Addrv6:    cloneIPNet(ep.addrv6),
+	}
+	copy(config.NetworkKey[:], key[:16])
+	if config.Addr == nil && config.Addrv6 == nil {
+		return localEndpointConfig{}, false
+	}
+	return config, true
+}
+
+func upsertLocalEndpoint(sources, endpoints4, endpoints6 *ebpf.Map, ep localEndpointConfig) error {
+	if sources == nil || endpoints4 == nil || endpoints6 == nil {
+		return nil
+	}
+	if strings.TrimSpace(ep.HostIf) != "" {
+		link, err := hostLinkByName(ep.HostIf)
+		if err != nil {
+			return fmt.Errorf("resolve local endpoint host interface %q: %w", ep.HostIf, err)
+		}
+		ep.EndpointIfindex = uint32(link.Attrs().Index)
+	}
+	if ep.EndpointIfindex == 0 {
+		return fmt.Errorf("missing local endpoint ifindex for %s", ep.HostIf)
+	}
+
+	var errs []error
+	source := localSourceValue{NetworkID: ep.NetworkKey}
+	if err := sources.Put(ep.EndpointIfindex, source); err != nil {
+		errs = append(errs, fmt.Errorf("program local source map for %s: %w", ep.HostIf, err))
+	}
+	if ep.Addr != nil {
+		key, value, err := localEndpointEntryV4(ep)
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := endpoints4.Put(key, value); err != nil {
+			errs = append(errs, fmt.Errorf("program local ipv4 endpoint map for %s: %w", ep.Addr, err))
+		}
+	}
+	if ep.Addrv6 != nil {
+		key, value, err := localEndpointEntryV6(ep)
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := endpoints6.Put(key, value); err != nil {
+			errs = append(errs, fmt.Errorf("program local ipv6 endpoint map for %s: %w", ep.Addrv6, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func removeLocalEndpoint(sources, endpoints4, endpoints6 *ebpf.Map, ep localEndpointConfig) error {
+	if sources == nil || endpoints4 == nil || endpoints6 == nil {
+		return nil
+	}
+	if strings.TrimSpace(ep.HostIf) != "" && ep.EndpointIfindex == 0 {
+		if link, err := hostLinkByName(ep.HostIf); err == nil {
+			ep.EndpointIfindex = uint32(link.Attrs().Index)
+		}
+	}
+
+	var errs []error
+	if ep.EndpointIfindex != 0 {
+		if err := sources.Delete(ep.EndpointIfindex); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, fmt.Errorf("delete local source map entry for %s: %w", ep.HostIf, err))
+		}
+	}
+	if ep.Addr != nil {
+		key, _, err := localEndpointEntryV4(ep)
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := endpoints4.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, fmt.Errorf("delete local ipv4 endpoint map entry for %s: %w", ep.Addr, err))
+		}
+	}
+	if ep.Addrv6 != nil {
+		key, _, err := localEndpointEntryV6(ep)
+		if err != nil {
+			errs = append(errs, err)
+		} else if err := endpoints6.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, fmt.Errorf("delete local ipv6 endpoint map entry for %s: %w", ep.Addrv6, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func localEndpointEntryV4(ep localEndpointConfig) (localEndpointV4Key, localEndpointValue, error) {
+	if ep.Addr == nil || ep.Addr.IP == nil {
+		return localEndpointV4Key{}, localEndpointValue{}, fmt.Errorf("missing ipv4 local endpoint address")
+	}
+	ip4 := ep.Addr.IP.To4()
+	if ip4 == nil {
+		return localEndpointV4Key{}, localEndpointValue{}, fmt.Errorf("invalid ipv4 local endpoint address %s", ep.Addr)
+	}
+	return localEndpointV4Key{
+		NetworkID:  ep.NetworkKey,
+		EndpointIP: binary.BigEndian.Uint32(ip4),
+	}, localEndpointValue{Ifindex: ep.EndpointIfindex}, nil
+}
+
+func localEndpointEntryV6(ep localEndpointConfig) (localEndpointV6Key, localEndpointValue, error) {
+	if ep.Addrv6 == nil || ep.Addrv6.IP == nil {
+		return localEndpointV6Key{}, localEndpointValue{}, fmt.Errorf("missing ipv6 local endpoint address")
+	}
+	ip6 := ep.Addrv6.IP.To16()
+	if ip6 == nil || ep.Addrv6.IP.To4() != nil {
+		return localEndpointV6Key{}, localEndpointValue{}, fmt.Errorf("invalid ipv6 local endpoint address %s", ep.Addrv6)
+	}
+	key := localEndpointV6Key{NetworkID: ep.NetworkKey}
+	copy(key.EndpointIP[:], ip6)
+	return key, localEndpointValue{Ifindex: ep.EndpointIfindex}, nil
 }
 
 func publishedPortEntryV6(binding portmapperapi.PortBinding) (publishedPortV6Key, publishedPortV6Value, error) {

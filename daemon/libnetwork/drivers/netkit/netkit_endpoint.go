@@ -78,6 +78,9 @@ func (d *driver) DeleteEndpoint(nid, eid string) error {
 		return err
 	}
 
+	if err := d.removeLocalEndpointDatapaths(ep); err != nil {
+		log.G(context.TODO()).WithError(err).Warnf("failed to remove netkit local endpoint datapath state for endpoint %.7s", ep.id)
+	}
 	if err := d.detachEndpointDatapath(ep); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("failed to detach netkit endpoint datapath for endpoint %.7s", ep.id)
 	}
